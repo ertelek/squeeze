@@ -14,15 +14,23 @@ class HomeShell extends StatefulWidget {
 
 class _HomeShellState extends State<HomeShell> {
   int? _index; // null = deciding
+  late final PageController _pageController;
+
   final _storage = StorageService();
   final _mgr = CompressionManager();
-  final _statusKey = GlobalKey<StatusTabState>(); // ⬅️ updated type
+  final _statusKey = GlobalKey<StatusTabState>();
 
   @override
   void initState() {
     super.initState();
     _decideInitialTab();
     _autoResumeIfNeeded();
+  }
+
+  @override
+  void dispose() {
+    _pageController.dispose();
+    super.dispose();
   }
 
   Future<void> _autoResumeIfNeeded() async {
@@ -36,22 +44,30 @@ class _HomeShellState extends State<HomeShell> {
   }
 
   Future<void> _decideInitialTab() async {
-    // If a run is already active, go to Status.
     if (_mgr.isRunning) {
-      setState(() => _index = 0);
-      _statusKey.currentState?.refreshJobs();
-      return;
+      _index = 0;
+    } else {
+      final opts = await _storage.loadOptions();
+      final selected =
+          (opts['selectedFolders'] as List?)?.cast<String>() ?? const <String>[];
+      _index = selected.isEmpty ? 1 : 0;
     }
 
-    // Otherwise check selected folders in persisted options.
-    final opts = await _storage.loadOptions();
-    final selected =
-        (opts['selectedFolders'] as List?)?.cast<String>() ?? const <String>[];
-    setState(() => _index = selected.isEmpty ? 1 : 0); // 1=Settings, 0=Status
+    _pageController = PageController(initialPage: _index!);
+
+    if (mounted) setState(() {});
+    if (_index == 0) {
+      _statusKey.currentState?.refreshJobs();
+    }
   }
 
   void _goToStatusTab() {
     setState(() => _index = 0);
+    _pageController.animateToPage(
+      0,
+      duration: const Duration(milliseconds: 10),
+      curve: Curves.fastEaseInToSlowEaseOut,
+    );
     _statusKey.currentState?.refreshJobs();
   }
 
@@ -64,12 +80,15 @@ class _HomeShellState extends State<HomeShell> {
     }
 
     return Scaffold(
-      body: IndexedStack(
-        index: _index!,
+      body: PageView(
+        controller: _pageController,
+        onPageChanged: (i) {
+          setState(() => _index = i);
+          if (i == 0) _statusKey.currentState?.refreshJobs();
+        },
         children: [
-          StatusTab(key: _statusKey), // ⬅️ updated class
-          SettingsTab(
-              goToStatusTab: _goToStatusTab), // switch to Status after Start
+          StatusTab(key: _statusKey),
+          SettingsTab(goToStatusTab: _goToStatusTab),
           const AboutTab(),
         ],
       ),
@@ -77,9 +96,12 @@ class _HomeShellState extends State<HomeShell> {
         selectedIndex: _index!,
         onDestinationSelected: (i) {
           setState(() => _index = i);
-          if (i == 0) {
-            _statusKey.currentState?.refreshJobs();
-          }
+          _pageController.animateToPage(
+            i,
+            duration: const Duration(milliseconds: 10),
+            curve: Curves.fastEaseInToSlowEaseOut,
+          );
+          if (i == 0) _statusKey.currentState?.refreshJobs();
         },
         destinations: const [
           NavigationDestination(

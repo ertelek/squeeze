@@ -1,23 +1,22 @@
 import 'dart:io';
+
 import 'package:flutter/material.dart';
-import 'package:file_picker/file_picker.dart';
-import 'package:path/path.dart' as p;
+import 'package:permission_handler/permission_handler.dart';
+import 'package:photo_manager/photo_manager.dart';
+
 import '../models/folder_job.dart';
 import '../models/job_status.dart';
-import '../services/storage.dart';
 import '../services/compression_manager.dart';
-import 'package:permission_handler/permission_handler.dart';
-import 'package:android_intent_plus/android_intent.dart';
+import '../services/storage.dart';
 
-/// Settings screen for configuring compression scope, options, and starting/stopping
-/// the background compression pipeline.
-///
-/// Behavior highlights:
-/// - Two modes: **Selected folders** vs **All folders**.
-/// - When **All folders** is selected, the suffix is cleared (unused in that flow).
-/// - When **Keep original files** is **unchecked**, the suffix is cleared.
-/// - “Permissions” section is hidden once MANAGE_EXTERNAL_STORAGE is granted.
-/// - The Start/Stop button disables starting when suffix is required but empty.
+/// Lightweight representation of a video album/bucket from MediaStore.
+class _AlbumInfo {
+  final String id;
+  final String name;
+
+  const _AlbumInfo({required this.id, required this.name});
+}
+
 class SettingsTab extends StatefulWidget {
   const SettingsTab({super.key, this.goToStatusTab});
   final VoidCallback? goToStatusTab;
@@ -27,41 +26,50 @@ class SettingsTab extends StatefulWidget {
 }
 
 class _SettingsTabState extends State<SettingsTab> {
-  // Services
   final _storage = StorageService();
   final _manager = CompressionManager();
 
-  // State
+  /// Jobs for albums that are currently selected for compression.
   Map<String, FolderJob> _jobs = {};
+
+  /// All video albums discovered on device.
+  List<_AlbumInfo> _albums = [];
+
+  /// Set of album ids that the user has checked.
+  Set<String> _selectedAlbumIds = <String>{};
+
   final TextEditingController _suffixCtl = TextEditingController();
   bool _keepOriginal = false;
 
-  /// `false` = Selected folders; `true` = All folders.
-  bool _allFoldersMode = true;
+  // Old files tracking (trash)
+  int _oldCount = 0;
+  int _oldBytes = 0;
 
-  /// Tracks MANAGE_EXTERNAL_STORAGE ("All files access") status on Android.
-  bool _hasAllFilesAccess = false;
+  bool get _hasOldFiles => _oldCount > 0;
 
-  /// Disable Start when:
-  /// - In selected-folders mode, no folders are chosen; or
-  /// - In selected-folders mode + keepOriginal is ON + suffix is empty.
-  bool get _shouldDisableStart =>
-      (!_allFoldersMode && _jobs.isEmpty) ||
-      (!_manager.isRunning &&
-          !_allFoldersMode &&
-          _keepOriginal &&
-          _suffixCtl.text.trim().isEmpty);
+  // ✅ NEW: initial loading gate
+  bool _isInitialLoading = true;
 
-  static const String _scopeInfoText =
-      'All videos in your Internal Storage will be compressed. '
-      'The “Internal Storage” root will be processed without recursion, '
-      'and each immediate folder within it will be processed recursively. '
-      'Original files will be deleted when done.';
+  bool get _shouldDisableStart {
+    if (_manager.isRunning) return false; // allow stopping while running
+
+    // 🔒 Block starting compression if there are old files pending deletion.
+    if (_hasOldFiles) return true;
+
+    if (_selectedAlbumIds.isEmpty) return true;
+    if (_keepOriginal && _suffixCtl.text.trim().isEmpty) return true;
+    return false;
+  }
+
+  static const String _albumsInfoText =
+      'Squeeze! will compress all videos inside the albums you select below.\n\n'
+      '• If you select a few albums, only videos in those albums are compressed.\n'
+      '• If you select all albums, all videos on your device will be compressed.';
 
   @override
   void initState() {
     super.initState();
-    _loadPersistedState();
+    _runInitialLoad();
   }
 
   @override
@@ -70,17 +78,31 @@ class _SettingsTabState extends State<SettingsTab> {
     super.dispose();
   }
 
-  /// Confirms that the user understands originals will be replaced/deleted.
-  /// Returns true if the user chooses to proceed.
+  Future<void> _runInitialLoad() async {
+    if (mounted) setState(() => _isInitialLoading = true);
+
+    try {
+      // We do this in a safe order:
+      // 1) load albums (permission + MediaStore scan)
+      // 2) load persisted jobs/options
+      // 3) load old files stats
+      await _loadAlbumsForSelection();
+      await _loadPersistedState();
+      await _loadOldFilesStats();
+    } finally {
+      if (mounted) setState(() => _isInitialLoading = false);
+    }
+  }
+
   Future<bool> _confirmOriginalsWillBeDeleted() async {
     final bool? proceed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Start compression'),
         content: const Text(
-          'Your original videos will be replaced with the compressed versions, '
-          'and the originals will be deleted.\n\n'
-          'This action cannot be undone.',
+          'Your original videos will be replaced with compressed versions.\n\n'
+          'The originals will be kept as "old files" which you can '
+          'delete in Squeeze!.',
         ),
         actions: [
           TextButton(
@@ -98,69 +120,156 @@ class _SettingsTabState extends State<SettingsTab> {
   }
 
   // ────────────────────────────────────────────────────────────────────────────
-  // Permissions
+  // Permissions (Media / Notify)
   // ────────────────────────────────────────────────────────────────────────────
 
-  /// Refreshes and caches whether MANAGE_EXTERNAL_STORAGE is granted.
-  Future<void> _refreshAllFilesAccessStatus() async {
-    if (!Platform.isAndroid) {
-      setState(() => _hasAllFilesAccess = true);
-      return;
+  Future<bool> _ensureMediaPermission() async {
+    if (!Platform.isAndroid) return true;
+
+    final ps = await PhotoManager.requestPermissionExtend();
+    if (ps.isAuth || ps.hasAccess) {
+      return true;
     }
-    final status = await Permission.manageExternalStorage.status;
-    if (mounted) setState(() => _hasAllFilesAccess = status.isGranted);
+
+    if (context.mounted) {
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Allow access to videos'),
+          content: const Text(
+            'Squeeze! needs access to your videos in order to compress them. '
+            'Please allow access in the system dialog or app settings.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () {
+                PhotoManager.openSetting();
+                Navigator.of(ctx).pop();
+              },
+              child: const Text('Open settings'),
+            ),
+          ],
+        ),
+      );
+    }
+    return false;
   }
 
-  /// Opens the “All files access” settings page and polls for grant.
-  Future<void> _requestAllFilesAccess() async {
-    if (!Platform.isAndroid) return;
+  // ────────────────────────────────────────────────────────────────────────────
+  // Old files (trash) stats
+  // ────────────────────────────────────────────────────────────────────────────
 
-    var status = await Permission.manageExternalStorage.status;
-    if (status.isGranted) {
-      setState(() => _hasAllFilesAccess = true);
-      return;
+  Future<void> _loadOldFilesStats() async {
+    int count = 0;
+    int bytes = 0;
+
+    try {
+      final items = await _storage.loadTrash();
+      count = items.length;
+      for (final item in items) {
+        bytes += item.bytes;
+      }
+    } catch (_) {
+      count = 0;
+      bytes = 0;
     }
 
-    const intent = AndroidIntent(
-      action: 'android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION',
-      data: 'package:com.ertelek.squeeze',
+    _oldCount = count;
+    _oldBytes = bytes;
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes <= 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    double v = bytes.toDouble();
+    int i = 0;
+    while (v >= 1000 && i < units.length - 1) {
+      v /= 1000;
+      i++;
+    }
+    return '${v.toStringAsFixed(1)} ${units[i]}';
+  }
+
+  Widget _buildOldFilesBanner(BuildContext context) {
+    if (!_hasOldFiles) return const SizedBox.shrink();
+
+    return Card(
+      color: Theme.of(context).colorScheme.secondaryContainer,
+      margin: const EdgeInsets.fromLTRB(4, 4, 4, 12),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Clear old files',
+              style: Theme.of(context)
+                  .textTheme
+                  .titleMedium
+                  ?.copyWith(fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'Before starting a new compression run, please clear your old files.\n\n'
+              'There ${_oldCount == 1 ? 'is' : 'are'} $_oldCount old '
+              '${_oldCount == 1 ? 'video' : 'videos'} that can now be deleted '
+              '(${_formatBytes(_oldBytes)}).',
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                ElevatedButton.icon(
+                  onPressed: () async {
+                    await _clearOldFilesAndRefresh();
+                  },
+                  icon: const Icon(Icons.delete_forever_outlined),
+                  label: const Text('Clear old files now'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
     );
-    await intent.launch();
+  }
 
-    // Poll briefly for the user's decision.
-    for (int i = 0; i < 15; i++) {
-      await Future.delayed(const Duration(seconds: 1));
-      status = await Permission.manageExternalStorage.status;
-      if (status.isGranted) break;
-    }
-    if (mounted) setState(() => _hasAllFilesAccess = status.isGranted);
+  Future<void> _clearOldFilesAndRefresh() async {
+    await _manager.clearOldFiles();
+    await _loadOldFilesStats();
+    if (mounted) setState(() {});
   }
 
   // ────────────────────────────────────────────────────────────────────────────
   // Loading & persistence
   // ────────────────────────────────────────────────────────────────────────────
 
-  /// Loads jobs and options from storage, infers mode, and updates permission state.
   Future<void> _loadPersistedState() async {
-    _jobs = await _storage.loadJobs();
-
+    final jobs = await _storage.loadJobs();
     final options = await _storage.loadOptions();
+
     _suffixCtl.text = (options['suffix'] ?? '').toString();
     _keepOriginal = (options['keepOriginal'] ?? false) as bool;
 
-    // Infer mode from existing jobs (presence of "Internal Storage" root).
-    _allFoldersMode = _jobs.isEmpty ||
-        _jobs.values.any((j) =>
-            j.displayName == 'Internal Storage' &&
-            p.normalize(j.folderPath) ==
-                p.normalize(_androidInternalStorageRoot()));
+    final selected = (options['selectedFolders'] as List?)?.cast<String>() ??
+        const <String>[];
 
-    await _refreshAllFilesAccessStatus();
+    if (selected.isEmpty && jobs.isNotEmpty) {
+      _selectedAlbumIds = jobs.keys.toSet();
+    } else {
+      _selectedAlbumIds = selected.toSet();
+    }
 
-    if (mounted) setState(() {});
+    _jobs = {
+      for (final e in jobs.entries)
+        if (_selectedAlbumIds.contains(e.key)) e.key: e.value,
+    };
   }
 
-  /// Resets progress counters/fields on all jobs to their initial state.
   void _resetAllJobsProgress(Map<String, FolderJob> jobs) {
     for (final job in jobs.values) {
       job.processedBytes = 0;
@@ -173,7 +282,6 @@ class _SettingsTabState extends State<SettingsTab> {
     }
   }
 
-  /// Clears the suffix field in-memory and on disk, and rebuilds the UI.
   Future<void> _clearSuffixAndPersist() async {
     if (_suffixCtl.text.isEmpty) return;
     _suffixCtl.text = '';
@@ -182,129 +290,153 @@ class _SettingsTabState extends State<SettingsTab> {
   }
 
   // ────────────────────────────────────────────────────────────────────────────
-  // Folder selection & indexing
+  // Album discovery & selection (MediaStore)
   // ────────────────────────────────────────────────────────────────────────────
 
-  /// Prompts the user to choose a folder and registers it as a recursive job
-  /// (only for Selected-folders mode).
-  Future<void> _pickAndAddFolder() async {
-    await _requestAllFilesAccess(); // ensure access first (Android)
-    if (!_hasAllFilesAccess) return;
+  Future<void> _loadAlbumsForSelection() async {
+    final ok = await _ensureMediaPermission();
+    if (!ok) {
+      _albums = [];
+      return;
+    }
 
-    final dirPath = await FilePicker.platform
-        .getDirectoryPath(dialogTitle: 'Pick a folder');
-    if (dirPath == null) return;
-
-    final dir = Directory(dirPath);
-    if (!await dir.exists()) return;
-
-    final display = _leafName(dirPath);
-    _jobs[dirPath] = FolderJob(
-      displayName: display,
-      folderPath: dirPath,
-      recursive: true,
+    final paths = await PhotoManager.getAssetPathList(
+      type: RequestType.video,
     );
+
+    _albums = paths
+        .map((p) => _AlbumInfo(id: p.id, name: p.name))
+        .toList(growable: false);
+  }
+
+  Future<void> _indexAllAlbumsJobs() async {
+    _jobs.clear();
+
+    final ok = await _ensureMediaPermission();
+    if (!ok) return;
+
+    final paths = await PhotoManager.getAssetPathList(
+      type: RequestType.video,
+    );
+
+    for (final path in paths) {
+      _jobs[path.id] = FolderJob(
+        displayName: path.name,
+        folderPath: path.id,
+        recursive: true,
+      );
+    }
+
+    _selectedAlbumIds = _jobs.keys.toSet();
 
     await _storage.saveJobs(_jobs);
     await _storage.saveOptions(selectedFolders: _jobs.keys.toList());
+
     if (mounted) setState(() {});
   }
 
-  /// Returns the leaf folder name for display, falling back to the full path.
-  String _leafName(String folderPath) {
-    final base = p.basename(folderPath);
-    return base.isEmpty ? folderPath : base;
-  }
-
-  /// Platform root used to enumerate user-visible storage on Android.
-  /// On non-Android, returns the process directory (not used for whole-device scan).
-  String _androidInternalStorageRoot() {
-    if (!Platform.isAndroid) return Directory.current.path;
-    return Directory('/storage/emulated/0').path;
-  }
-
-  /// Builds jobs for **All folders** mode:
-  /// - Adds “Internal Storage” root (non-recursive)
-  /// - Adds each immediate child directory (recursive)
-  Future<void> _indexAllFoldersJobs() async {
-    _jobs.clear();
-
-    final rootPath = _androidInternalStorageRoot();
-    final rootDir = Directory(rootPath);
-
-    _jobs[rootPath] = FolderJob(
-      displayName: 'Internal Storage',
-      folderPath: rootPath,
-      recursive: false,
-    );
-
-    try {
-      await for (final ent
-          in rootDir.list(recursive: false, followLinks: false)) {
-        if (ent is! Directory) continue;
-        final path = ent.path;
-        final name = p.basename(path);
-        if (name.isEmpty || name == 'Android' || name.startsWith('.')) continue;
-
-        _jobs[path] = FolderJob(
-          displayName: name,
-          folderPath: path,
-          recursive: true,
-        );
-      }
-    } catch (_) {
-      // ignore traversal errors (permission prompts appear elsewhere)
+  Future<void> _toggleAlbumSelection(_AlbumInfo album, bool selected) async {
+    if (selected) {
+      _selectedAlbumIds.add(album.id);
+      _jobs[album.id] = _jobs[album.id] ??
+          FolderJob(
+            displayName: album.name,
+            folderPath: album.id,
+            recursive: true,
+          );
+    } else {
+      _selectedAlbumIds.remove(album.id);
+      _jobs.remove(album.id);
     }
 
     await _storage.saveJobs(_jobs);
-    await _storage.saveOptions(selectedFolders: _jobs.keys.toList());
+    await _storage.saveOptions(
+      selectedFolders: _selectedAlbumIds.toList(),
+    );
+
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _setAllAlbumSelections(bool selected) async {
+    if (_albums.isEmpty) return;
+
+    if (selected) {
+      _selectedAlbumIds = _albums.map((a) => a.id).toSet();
+      for (final album in _albums) {
+        _jobs[album.id] = _jobs[album.id] ??
+            FolderJob(
+              displayName: album.name,
+              folderPath: album.id,
+              recursive: true,
+            );
+      }
+    } else {
+      _selectedAlbumIds.clear();
+      _jobs.clear();
+    }
+
+    await _storage.saveJobs(_jobs);
+    await _storage.saveOptions(
+      selectedFolders: _selectedAlbumIds.toList(),
+    );
+
+    if (mounted) setState(() {});
   }
 
   // ────────────────────────────────────────────────────────────────────────────
   // Start / Stop
   // ────────────────────────────────────────────────────────────────────────────
 
-  /// Starts or stops the compression pipeline.
-  ///
-  /// On stop:
-  /// - Waits for the worker to unwind
-  /// - Clears jobs and selected folders, so Status tab shows empty state
   Future<void> _onStartStopPressed() async {
-    // If running/paused → this is a STOP request; do NOT show the dialog.
     if (_isLocked) {
-      await _manager.stopAndWait();
+      _selectedAlbumIds.clear();
       _jobs.clear();
       await _storage.saveJobs({});
       await _storage.saveOptions(selectedFolders: []);
-      _jobs = await _storage.loadJobs();
+      _albums = [];
       if (mounted) setState(() {});
+
+      await _manager.stopAndWait();
+
+      // Re-run our initial loads after stopping
+      await _runInitialLoad();
       return;
     }
 
-    // We are about to START. If "All folders" OR "Keep original" is OFF,
-    // ask for explicit confirmation that originals will be replaced/deleted.
-    final bool needsWarning = _allFoldersMode || !_keepOriginal;
+    // Hard stop: must clear old files first
+    if (_hasOldFiles) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please clear old files before starting compression.'),
+        ),
+      );
+      return;
+    }
+
+    final bool needsWarning = !_keepOriginal;
     if (needsWarning) {
       final ok = await _confirmOriginalsWillBeDeleted();
-      if (!ok) return; // user cancelled
+      if (!ok) return;
     }
 
-    // Build jobs according to the selected mode
-    if (_allFoldersMode) {
-      await _requestAllFilesAccess();
-      if (!_hasAllFilesAccess) return;
-      await _indexAllFoldersJobs();
+    final bool isCompressAll =
+        _albums.isNotEmpty && _selectedAlbumIds.length == _albums.length;
+
+    if (isCompressAll) {
+      await _indexAllAlbumsJobs();
     } else {
-      await _storage.saveOptions(selectedFolders: _jobs.keys.toList());
+      await _storage.saveJobs(_jobs);
+      await _storage.saveOptions(
+        selectedFolders: _selectedAlbumIds.toList(),
+      );
     }
 
-    // Persist options (use current suffix/keepOriginal values)
     await _storage.saveOptions(
       suffix: _suffixCtl.text.trim(),
       keepOriginal: _keepOriginal,
     );
 
-    // Reset progress & save
     final jobs = await _storage.loadJobs();
     _resetAllJobsProgress(jobs);
     await _storage.saveJobs(jobs);
@@ -313,30 +445,14 @@ class _SettingsTabState extends State<SettingsTab> {
       await Permission.notification.request();
     }
 
-    // Start worker
     // ignore: unawaited_futures
     _manager.start();
-
-    // Jump to Status tab
     widget.goToStatusTab?.call();
-
     if (mounted) setState(() {});
   }
 
-  /// Prepares **All folders** mode by ensuring permissions and indexing scope.
-  Future<void> _prepareAllFoldersMode() async {
-    await _requestAllFilesAccess();
-    if (!_hasAllFilesAccess) return;
-    await _indexAllFoldersJobs();
-  }
-
-  // ────────────────────────────────────────────────────────────────────────────
-  // UI helpers
-  // ────────────────────────────────────────────────────────────────────────────
-
   bool get _isLocked => _manager.isRunning || _manager.isPaused;
 
-  /// Greys out and disables a subtree while compression is running/paused.
   Widget _disabledWhenLocked({required Widget child}) {
     return Opacity(
       opacity: _isLocked ? 0.5 : 1,
@@ -346,16 +462,65 @@ class _SettingsTabState extends State<SettingsTab> {
 
   Widget _sectionDivider() => const Divider(height: 32, thickness: 1);
 
-  /// Start/Stop floating action button with contextual tooltip and disabled logic.
+  Widget _albumRow({
+    required _AlbumInfo album,
+    required bool selected,
+    required ValueChanged<bool> onChanged,
+  }) {
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Checkbox(
+            value: selected,
+            onChanged: _isLocked ? null : (v) => onChanged(v ?? false),
+          ),
+        ],
+      ),
+      title: Text(album.name),
+      onTap: _isLocked ? null : () => onChanged(!selected),
+    );
+  }
+
+  Widget _selectAllAlbumsRow({
+    required bool allSelected,
+    required ValueChanged<bool> onChanged,
+  }) {
+    return Opacity(
+      opacity: 0.65,
+      child: ListTile(
+        contentPadding: EdgeInsets.zero,
+        leading: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Checkbox(
+              value: allSelected,
+              onChanged: _isLocked ? null : (v) => onChanged(v ?? false),
+            ),
+          ],
+        ),
+        title: const Text('Select all albums'),
+        onTap: _isLocked ? null : () => onChanged(!allSelected),
+      ),
+    );
+  }
+
   Widget _startStopFab({required bool running}) {
-    final disabled = _shouldDisableStart;
+    final disabled = _isInitialLoading ? true : _shouldDisableStart;
+
     final Color? bgColor =
-        running ? Colors.red : (disabled ? null : Colors.green);
-    final tooltip = running
-        ? 'Stop compression'
-        : (disabled
-            ? 'Add a suffix or uncheck “Keep original files”'
-            : 'Start compression');
+        disabled ? null : (running ? Colors.red : Colors.green);
+
+    final tooltip = _isInitialLoading
+        ? 'Loading…'
+        : (running
+            ? 'Stop compression'
+            : (_hasOldFiles
+                ? 'Clear old files first'
+                : (disabled
+                    ? 'Select at least one album or uncheck “Keep original files”'
+                    : 'Start compression')));
 
     return Tooltip(
       message: tooltip,
@@ -370,234 +535,229 @@ class _SettingsTabState extends State<SettingsTab> {
     );
   }
 
-  Widget _sectionHeader(String title) => Padding(
-        padding: const EdgeInsets.only(bottom: 8),
-        child: Text(
-          title,
-          style: Theme.of(context)
-              .textTheme
-              .titleMedium
-              ?.copyWith(fontWeight: FontWeight.w600),
-        ),
-      );
-
-  // ────────────────────────────────────────────────────────────────────────────
-  // Build
-  // ────────────────────────────────────────────────────────────────────────────
-
   @override
   Widget build(BuildContext context) {
+    if (_isInitialLoading) {
+      return Scaffold(
+        appBar: AppBar(title: Text('Settings')),
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
     final running = _manager.isRunning;
-    final suffixRequired = !_allFoldersMode && _keepOriginal;
-    final suffixEmpty = _suffixCtl.text.trim().isEmpty;
+    final bool allSelected =
+        _albums.isNotEmpty && _selectedAlbumIds.length == _albums.length;
 
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
       body: ListView(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         children: [
-          // Mode
-          _sectionHeader('Mode'),
-          _disabledWhenLocked(
-            child: ListTile(
-              contentPadding: EdgeInsets.zero,
-              title: Row(
-                children: [
-                  const Expanded(
-                    child: Text('Compress all videos on this device'),
+          _buildOldFilesBanner(context),
+
+          // Albums header
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Albums',
+                    style: Theme.of(context)
+                        .textTheme
+                        .titleMedium
+                        ?.copyWith(fontWeight: FontWeight.w600),
                   ),
-                  IconButton(
-                    tooltip: 'More info',
-                    icon: const Icon(Icons.info_outline),
-                    onPressed: () {
-                      showDialog<void>(
-                        context: context,
-                        builder: (ctx) => AlertDialog(
-                          title: const Text('Compress all videos'),
-                          content: const Text(_scopeInfoText),
-                          actions: [
-                            TextButton(
-                              onPressed: () => Navigator.of(ctx).pop(),
-                              child: const Text('OK'),
-                            ),
-                          ],
+                ),
+                IconButton(
+                  padding: const EdgeInsets.only(left: 8),
+                  tooltip: 'More info',
+                  icon: const Icon(Icons.info_outline),
+                  onPressed: () {
+                    showDialog<void>(
+                      context: context,
+                      builder: (ctx) => AlertDialog(
+                        title: const Text('How album selection works'),
+                        content: const Text(_albumsInfoText),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.of(ctx).pop(),
+                            child: const Text('OK'),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
+
+          _disabledWhenLocked(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (_albums.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Use the button below to scan for albums '
+                          'on your device.',
                         ),
-                      );
+                        const SizedBox(height: 8),
+                        ElevatedButton.icon(
+                          onPressed: _isLocked
+                              ? null
+                              : () async {
+                                  if (mounted) {
+                                    setState(() => _isInitialLoading = true);
+                                  }
+                                  try {
+                                    await _runInitialLoad();
+                                  } finally {
+                                    if (mounted) {
+                                      setState(() => _isInitialLoading = false);
+                                    }
+                                  }
+                                },
+                          icon: const Icon(Icons.refresh),
+                          label: const Text('Reload albums & settings'),
+                        ),
+                      ],
+                    ),
+                  )
+                else ...[
+                  _selectAllAlbumsRow(
+                    allSelected: allSelected,
+                    onChanged: (val) async {
+                      await _setAllAlbumSelections(val);
                     },
                   ),
+                  const SizedBox(height: 4),
+                  Column(
+                    children: _albums
+                        .map(
+                          (album) => _albumRow(
+                            album: album,
+                            selected: _selectedAlbumIds.contains(album.id),
+                            onChanged: (val) async {
+                              await _toggleAlbumSelection(album, val);
+                            },
+                          ),
+                        )
+                        .toList(),
+                  ),
                 ],
-              ),
-              trailing: Switch.adaptive(
-                value: _allFoldersMode,
-                onChanged: _isLocked
-                    ? null
-                    : (v) async {
-                        setState(() => _allFoldersMode = v);
-                        if (v) {
-                          // Switching to ALL folders → clear suffix immediately.
-                          await _clearSuffixAndPersist();
-                          await _prepareAllFoldersMode();
-                          if (mounted) setState(() {});
-                        } else {
-                          _jobs.clear();
-                          await _storage.saveJobs(_jobs);
-                          await _storage.saveOptions(selectedFolders: []);
-                          if (mounted) setState(() {});
-                        }
-                      },
-              ),
+              ],
             ),
           ),
 
           _sectionDivider(),
 
-          // Permissions (hidden once granted or on non-Android)
-          if (!_hasAllFilesAccess) ...[
-            _sectionHeader('Permissions'),
-            ListTile(
-              contentPadding: EdgeInsets.zero,
-              title: const Text('Grant “All files access”'),
-              subtitle: const Text('Required for scanning / saving videos'),
-              onTap: _requestAllFilesAccess,
-              trailing: const Icon(Icons.chevron_right),
-            ),
-            _sectionDivider(),
-          ],
-
-          // Selected-folders options
-          if (!_allFoldersMode) ...[
-            _sectionHeader('Folders & Options'),
-            _disabledWhenLocked(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    title: const Text('Add folder'),
-                    subtitle: const Text('Choose a folder to include'),
-                    enabled: !_isLocked,
-                    onTap: _isLocked ? null : _pickAndAddFolder,
-                    trailing: const Icon(Icons.chevron_right),
+          // Options
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Options',
+                    style: Theme.of(context)
+                        .textTheme
+                        .titleMedium
+                        ?.copyWith(fontWeight: FontWeight.w600),
                   ),
-
-                  // Keep original files
-                  CheckboxListTile(
-                    contentPadding: EdgeInsets.zero,
-                    value: _keepOriginal,
-                    onChanged: _isLocked
-                        ? null
-                        : (v) async {
-                            final next = (v ?? false);
-                            setState(() => _keepOriginal = next);
-                            // If user deselects "Keep original" → clear suffix now.
-                            if (!next) {
-                              await _clearSuffixAndPersist();
-                            }
-                          },
-                    title: const Text('Keep original files after compression'),
-                  ),
-
-                  // Suffix is visible only when keeping originals.
-                  if (_keepOriginal)
-                    TextField(
-                      controller: _suffixCtl,
-                      onChanged: (_) => setState(() {}),
-                      enabled: !_isLocked,
-                      decoration: InputDecoration(
-                        isDense: true,
-                        label: Text.rich(
-                          TextSpan(
-                            children: [
-                              const TextSpan(text: 'Compressed file suffix'),
-                              if (suffixRequired)
-                                TextSpan(
-                                  text: ' *',
-                                  style: TextStyle(
-                                    color: Theme.of(context).colorScheme.error,
-                                  ),
-                                ),
-                            ],
-                          ),
-                          style: Theme.of(context)
-                              .textTheme
-                              .bodySmall
-                              ?.copyWith(fontSize: 14),
+                ),
+                IconButton(
+                  padding: const EdgeInsets.only(left: 8),
+                  tooltip: 'More info',
+                  icon: const Icon(Icons.info_outline),
+                  onPressed: () {
+                    showDialog<void>(
+                      context: context,
+                      builder: (ctx) => AlertDialog(
+                        title: const Text('Keep original files'),
+                        content: const Text(
+                          'Squeeze! will keep the original '
+                          'versions of your videos. The compressed copies will be saved '
+                          'with a suffix you choose.\n\n'
+                          '• If this is enabled, you must enter a suffix such as "_compressed".\n\n'
+                          '• If you turn OFF this option, Squeeze! will replace each original '
+                          'video with its compressed version to save space.',
                         ),
-                        floatingLabelStyle: Theme.of(context)
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.of(ctx).pop(),
+                            child: const Text('OK'),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
+
+          _disabledWhenLocked(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                CheckboxListTile(
+                  controlAffinity: ListTileControlAffinity.leading,
+                  contentPadding: EdgeInsets.zero,
+                  value: _keepOriginal,
+                  onChanged: _isLocked
+                      ? null
+                      : (v) async {
+                          final next = (v ?? false);
+                          setState(() => _keepOriginal = next);
+                          if (!next) {
+                            await _clearSuffixAndPersist();
+                          }
+                        },
+                  title: const Text('Keep original files after compression'),
+                ),
+                if (_keepOriginal)
+                  TextField(
+                    controller: _suffixCtl,
+                    onChanged: (_) => setState(() {}),
+                    enabled: !_isLocked,
+                    decoration: InputDecoration(
+                      isDense: true,
+                      label: Text.rich(
+                        TextSpan(
+                          children: [
+                            const TextSpan(text: 'Compressed file suffix'),
+                            TextSpan(
+                              text: ' *',
+                              style: TextStyle(
+                                color: Theme.of(context).colorScheme.error,
+                              ),
+                            ),
+                          ],
+                        ),
+                        style: Theme.of(context)
                             .textTheme
                             .bodySmall
-                            ?.copyWith(fontSize: 12),
-                        errorText: (suffixRequired && suffixEmpty)
-                            ? 'Suffix is required.'
-                            : null,
+                            ?.copyWith(fontSize: 14),
                       ),
+                      floatingLabelStyle: Theme.of(context)
+                          .textTheme
+                          .bodySmall
+                          ?.copyWith(fontSize: 12),
+                      errorText:
+                          (_keepOriginal && _suffixCtl.text.trim().isEmpty)
+                              ? 'Suffix is required.'
+                              : null,
                     ),
-
-                  const SizedBox(height: 20),
-                  const Text('Selected folders'),
-                  const SizedBox(height: 8),
-
-                  _jobs.isEmpty
-                      ? const Padding(
-                          padding: EdgeInsets.only(bottom: 8),
-                          child: Text('No folders selected yet.'),
-                        )
-                      : Column(
-                          children: _jobs.values
-                              .map(
-                                (j) => ListTile(
-                                  leading: const Icon(Icons.folder),
-                                  title: Text(j.displayName),
-                                  subtitle: Text(FolderJob.getPrettyFolderPath(
-                                      j.folderPath)),
-                                  trailing: IconButton(
-                                    icon: const Icon(Icons.delete_outline),
-                                    onPressed: _isLocked
-                                        ? null
-                                        : () async {
-                                            _jobs.remove(j.folderPath);
-                                            await _storage.saveJobs(_jobs);
-                                            await _storage.saveOptions(
-                                              selectedFolders:
-                                                  _jobs.keys.toList(),
-                                            );
-                                            if (mounted) setState(() {});
-                                          },
-                                  ),
-                                ),
-                              )
-                              .toList(),
-                        ),
-                ],
-              ),
+                  ),
+              ],
             ),
-          ],
-
-          // “All folders” preview
-          if (_allFoldersMode) ...[
-            _sectionHeader('All folders'),
-            const SizedBox(height: 8),
-            if (_jobs.isNotEmpty)
-              Column(
-                children: _jobs.values
-                    .map((j) => ListTile(
-                          dense: true,
-                          leading: Icon(
-                            j.recursive
-                                ? Icons.folder_copy_outlined
-                                : Icons.folder_outlined,
-                          ),
-                          title: Text(j.displayName),
-                          subtitle: Text(
-                            '${FolderJob.getPrettyFolderPath(j.folderPath)}\nrecursive: ${j.recursive}',
-                          ),
-                          isThreeLine: true,
-                        ))
-                    .toList(),
-              )
-            else
-              const Text('No folders indexed yet.'),
-          ],
+          ),
 
           const SizedBox(height: 64),
         ],

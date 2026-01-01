@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
+import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:path/path.dart' as p;
 
 typedef LogFn = void Function(String);
@@ -20,88 +21,168 @@ class VideoProcessor {
   /// Quotes a path safely for the shell invocation FFmpegKit builds internally.
   String _quote(String s) => '"${s.replaceAll('"', r'\"')}"';
 
-  /// Probe average frame rate via FFprobe and return a string FFmpeg accepts
-  /// for `-r` (e.g. "30", "29.970"). Falls back to "30" if unknown.
-  Future<String> _probeFrameRateString(File input) async {
-    final defaultFPS = '30';
+  /// If [candidatePath] already exists, keep appending `_tmp` (recursively)
+  /// before the extension until it doesn't.
+  Future<String> _uniqueOutPath(String candidatePath) async {
+    var path = candidatePath;
+    while (await File(path).exists()) {
+      final dir = p.dirname(path);
+      final ext = p.extension(path);
+      final base = p.basenameWithoutExtension(path);
+      path = p.join(dir, '${base}_tmp$ext');
+    }
+    return path;
+  }
 
-    _log('FFprobe: probing media info → ${input.path}');
+  /// Probe audio codec name (e.g. "aac", "mp3", "opus"). Returns null if unknown.
+  Future<String?> _probeAudioCodecName(File input) async {
+    _log('FFprobe: probing audio codec → ${input.path}');
     try {
       final session = await FFprobeKit.getMediaInformation(input.path);
       final info = session.getMediaInformation();
-      if (info == null) return defaultFPS;
-
-      final streams = info.getStreams();
-      if (streams == null) return defaultFPS;
+      final streams = info?.getStreams();
+      if (streams == null) return null;
 
       for (final s in streams) {
-        if (s.getType() == 'video') {
-          final afr =
-              s.getAllProperties()?['avg_frame_rate']?.toString() ?? '0/0';
-          if (!afr.contains('/')) break;
-
-          final parts = afr.split('/');
-          final num = double.tryParse(parts[0]) ?? 0.0;
-          final den = double.tryParse(parts[1]) ?? 1.0;
-          final fps = den == 0 ? 30.0 : (num / den);
-          final value =
-              (fps.isFinite && fps > 0) ? fps.toStringAsFixed(3) : defaultFPS;
-          return value;
+        if (s.getType() == 'audio') {
+          final props = s.getAllProperties();
+          final codec = (props?['codec_name'] ?? props?['codec_tag_string'])
+              ?.toString()
+              .toLowerCase()
+              .trim();
+          if (codec != null && codec.isNotEmpty) return codec;
         }
       }
     } catch (e) {
-      _log('FFprobe error: $e');
+      _log('FFprobe audio probe error: $e');
     }
-    return defaultFPS;
+    return null;
+  }
+
+  List<String> _buildCmd({
+    required File input,
+    required String outPath,
+    required bool toTemp,
+    required int targetCrf,
+    required bool copyAudio,
+  }) {
+    // NOTE: We intentionally do NOT set `-r`. FFmpeg will preserve the
+    // source timing/frame-rate using input timestamps by default.
+    return <String>[
+      '-y',
+      '-i',
+      _quote(input.path),
+
+      // Video
+      '-c:v',
+      'libx264',
+      '-preset',
+      'medium',
+      '-crf',
+      targetCrf.toString(),
+      '-pix_fmt',
+      'yuv420p',
+
+      // Audio
+      if (copyAudio) ...[
+        '-c:a',
+        'copy',
+      ] else ...[
+        '-c:a',
+        'aac',
+        '-b:a',
+        '192k', // better quality + safer fallback than 128k
+      ],
+
+      // Container flags
+      '-movflags',
+      '+faststart',
+      if (toTemp) ...['-f', 'mp4'],
+      _quote(outPath),
+    ];
+  }
+
+  Future<dynamic> _runFfmpeg(List<String> cmd) async {
+    final cmdStr = cmd.join(' ');
+    _log('FFmpeg: $cmdStr');
+    return FFmpegKit.executeAsync(cmdStr);
+  }
+
+  bool _isAacCodec(String? codec) {
+    final c = codec?.toLowerCase().trim();
+    return c == 'aac';
   }
 
   // ---- Public API ----------------------------------------------------------
 
-  /// Re-encodes [input] using H.264 (libx264) + AAC into [outputDirPath].
-  ///
-  /// - If [labelSuffix] is **empty**, the output is written as `<original>.temp`
-  ///   with muxer forced to MP4; the caller will later swap it in-place.
-  /// - If [labelSuffix] is **non-empty**, the output is written as
-  ///   `<stem><suffix>.mp4`.
-  ///
-  /// Returns the FFmpeg session handle and the actual output path.
   Future<({dynamic session, String outPath})> reencodeH264AacAsync(
     File input, {
     required String outputDirPath,
     required String labelSuffix,
     int targetCrf = 23,
   }) async {
-    final fps = await _probeFrameRateString(input);
     final stem = p.basenameWithoutExtension(input.path);
 
-    // Empty suffix → in-place flow using temp file next to source.
     final toTemp = labelSuffix.trim().isEmpty;
-    final originalBaseName = p.basename(input.path);
-    final outPath = toTemp
-        ? p.join(outputDirPath, '$originalBaseName.temp')
+    final initialOutPath = toTemp
+        ? p.join(outputDirPath, '${stem}_squeeze_tmp.mp4')
         : p.join(outputDirPath, '$stem$labelSuffix.mp4');
 
-    // Build FFmpeg command.
-    final cmd = <String>[
-      '-y',
-      '-i', _quote(input.path),
-      // Video
-      '-c:v', 'libx264',
-      '-preset', 'medium',
-      '-crf', targetCrf.toString(),
-      '-r', fps,
-      '-pix_fmt', 'yuv420p',
-      // Audio
-      '-c:a', 'aac',
-      '-b:a', '128k',
-      // Container flags
-      '-movflags', '+faststart',
-      if (toTemp) ...['-f', 'mp4'], // force MP4 when the suffix is .temp
-      _quote(outPath),
-    ];
+    final outPath = await _uniqueOutPath(initialOutPath);
 
-    _log('FFmpeg: ${cmd.join(' ')}');
-    final session = await FFmpegKit.executeAsync(cmd.join(' '));
-    return (session: session, outPath: outPath);
+    // Detect audio codec
+    final audioCodec = await _probeAudioCodecName(input);
+    final audioIsAac = _isAacCodec(audioCodec);
+
+    // Strategy:
+    // - If audio is AAC => try copy first, fallback to re-encode AAC if needed.
+    // - If audio is NOT AAC/unknown => go straight to AAC re-encode (more reliable),
+    //   but still safe for MP4 output.
+    if (audioIsAac) {
+      // 1) Try audio copy
+      var cmd = _buildCmd(
+        input: input,
+        outPath: outPath,
+        toTemp: toTemp,
+        targetCrf: targetCrf,
+        copyAudio: true,
+      );
+
+      var session = await _runFfmpeg(cmd);
+      final rc = await session.getReturnCode();
+
+      if (ReturnCode.isSuccess(rc)) {
+        return (session: session, outPath: outPath);
+      }
+
+      // 2) Fallback: delete any partial output, then re-encode audio to AAC
+      try {
+        final f = File(outPath);
+        if (await f.exists()) await f.delete();
+      } catch (_) {}
+
+      cmd = _buildCmd(
+        input: input,
+        outPath: outPath,
+        toTemp: toTemp,
+        targetCrf: targetCrf,
+        copyAudio: false,
+      );
+
+      session = await _runFfmpeg(cmd);
+      return (session: session, outPath: outPath);
+    } else {
+      // Non-AAC (or unknown): re-encode audio to AAC directly
+      final cmd = _buildCmd(
+        input: input,
+        outPath: outPath,
+        toTemp: toTemp,
+        targetCrf: targetCrf,
+        copyAudio: false,
+      );
+
+      final session = await _runFfmpeg(cmd);
+      return (session: session, outPath: outPath);
+    }
   }
 }
