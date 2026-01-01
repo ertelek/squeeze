@@ -31,7 +31,7 @@ class _AboutTabState extends State<AboutTab> {
   @override
   Widget build(BuildContext context) {
     const appName = 'Squeeze!';
-    const description = 'Compress videos on your phone to save space.';
+    const description = 'Compress videos on your device to save space.';
 
     return Scaffold(
       appBar: AppBar(title: const Text('About')),

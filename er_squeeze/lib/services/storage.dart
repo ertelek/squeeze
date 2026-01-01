@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 import '../models/folder_job.dart';
+import '../models/trash_item.dart';
 
 /// Simple JSON file storage to persist state across sessions.
 class StorageService {
@@ -22,7 +23,10 @@ class StorageService {
           'suffix': '',
           'keepOriginal': false,
           'selectedFolders': <String>[],
-        }
+        },
+        // Used now as the list of originals that have been compressed and are
+        // pending deletion ("old files").
+        'trash': <dynamic>[],
       }));
     }
     _file = f;
@@ -71,6 +75,53 @@ class StorageService {
     if (keepOriginal != null) o['keepOriginal'] = keepOriginal;
     if (selectedFolders != null) o['selectedFolders'] = selectedFolders;
     m['options'] = o;
+    await writeAll(m);
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // "Old files" persistence (formerly trash)
+  // ────────────────────────────────────────────────────────────────────────────
+
+  Future<List<TrashItem>> loadTrash() async {
+    final m = await readAll();
+    final rawList = (m['trash'] ?? const <dynamic>[]) as List;
+    return rawList
+        .map((e) => TrashItem.fromMap(
+            Map<String, dynamic>.from(e as Map<String, dynamic>)))
+        .toList();
+  }
+
+  Future<void> saveTrash(List<TrashItem> items) async {
+    final m = await readAll();
+    m['trash'] = items.map((e) => e.toMap()).toList();
+    await writeAll(m);
+  }
+
+  /// Add (or update) an entry representing an original that has been
+  /// successfully compressed and is pending deletion.
+  Future<void> addTrashItem(TrashItem item) async {
+    final items = await loadTrash();
+
+    // De-duplicate by assetId if available, otherwise by originalPath.
+    final idx = items.indexWhere((e) {
+      if (item.assetId.isNotEmpty && e.assetId.isNotEmpty) {
+        return e.assetId == item.assetId;
+      }
+      return e.originalPath == item.originalPath;
+    });
+
+    if (idx >= 0) {
+      items[idx] = item;
+    } else {
+      items.add(item);
+    }
+
+    await saveTrash(items);
+  }
+
+  Future<void> clearTrash() async {
+    final m = await readAll();
+    m['trash'] = <dynamic>[];
     await writeAll(m);
   }
 }

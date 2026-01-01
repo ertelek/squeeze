@@ -3,65 +3,43 @@ import 'dart:io';
 
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:fluttertoast/fluttertoast.dart';
-import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
+import 'package:photo_manager/photo_manager.dart';
 
 import '../models/folder_job.dart';
 import '../models/job_status.dart';
+import '../models/trash_item.dart';
 import '../services/foreground_notifier.dart';
 import '../services/storage.dart';
-import '../services/trash_helper.dart';
 import '../services/video_processor.dart';
+import 'storage_space_helper.dart';
 
-/// Coordinates scanning folders, re-encoding videos, progress accounting,
-/// and foreground notifications. Designed as a single-process singleton.
+/// Coordinates scanning video albums via MediaStore (photo_manager),
+/// re-encoding videos, progress accounting, and foreground notifications.
 class CompressionManager {
-  // ---- Singleton -----------------------------------------------------------
-
   static final CompressionManager _instance = CompressionManager._();
   CompressionManager._();
   factory CompressionManager() => _instance;
 
-  // ---- Dependencies --------------------------------------------------------
-
   final StorageService _storage = StorageService();
-
-  // ---- Runtime State -------------------------------------------------------
 
   bool _isRunningFlag = false;
   bool _isPausedFlag = false;
-
-  /// Active FFmpeg session id (if any), used to cancel safely.
   int? _activeFfmpegSessionId;
-
-  /// Completes once [start] has fully unwound and stopped.
   Completer<void>? _stopBarrier;
 
-  // ---- Constants -----------------------------------------------------------
-
-  static const Set<String> _videoExtensions = {
-    '.mp4',
-    '.mov',
-    '.mkv',
-    '.avi',
-    '.wmv',
-    '.flv',
-    '.m4v'
-  };
-
-  // ---- Public API ----------------------------------------------------------
-
-  /// Returns `true` while the pipeline is running (even if currently paused).
   bool get isRunning => _isRunningFlag;
-
-  /// Returns `true` if execution is temporarily paused.
   bool get isPaused => _isPausedFlag;
 
-  /// Starts the compression pipeline if not already running.
-  ///
-  /// Walks selected jobs, prescans total original bytes (recursively),
-  /// and then encodes one file at a time. Produces foreground notifications
-  /// on Android and persists job progress to storage after each step.
+  bool _isLastAssetInJob(FolderJob job, String assetId) {
+    for (final entry in job.fileIndex.entries) {
+      if (!entry.value.compressed && entry.key != assetId) {
+        return false; // found another asset still pending
+      }
+    }
+    return true; // this was the last one
+  }
+
   Future<void> start() async {
     if (_isRunningFlag) return;
 
@@ -70,63 +48,67 @@ class CompressionManager {
     _stopBarrier = Completer<void>();
     _log('Compression START');
 
-    // Foreground notification (Android) – safe to call elsewhere too
     await ForegroundNotifier.init();
     if (Platform.isAndroid) {
       await Permission.notification.request();
     }
+
     await ForegroundNotifier.start(
       title: 'Setting things up',
       text: 'Preparing to squeeze…',
     );
+
+    // Ensure media permission (MediaStore).
+    final ps = await PhotoManager.requestPermissionExtend();
+    if (!(ps.isAuth || ps.hasAccess)) {
+      _toast('Permission to access videos was denied.');
+      await _finish();
+      return;
+    }
 
     final jobs = await _storage.loadJobs();
     final options = await _storage.loadOptions();
     final suffix = (options['suffix'] ?? '_compressed').toString();
     final keepOriginal = (options['keepOriginal'] ?? false) as bool;
 
+    // Preload albums map: album id → AssetPathEntity
+    final allPaths = await PhotoManager.getAssetPathList(
+      type: RequestType.video,
+    );
+    final Map<String, AssetPathEntity> pathById = {
+      for (final pth in allPaths) pth.id: pth,
+    };
+
     for (final entry in jobs.entries) {
-      if (!_isRunningFlag) break; // stop requested
+      if (!_isRunningFlag) break;
 
       final job = entry.value;
       if (job.status == JobStatus.completed) continue;
 
-      job.status = JobStatus.inProgress;
-      await ForegroundNotifier.update(
-        title: 'Squeezing ${job.displayName}',
-        text: keepOriginal
-            ? ""
-            : _buildNotificationText(
-                job), // completed status is currently unsupported if keeping original files
-      );
-      await _storage.saveJobs(jobs);
-
-      _log('Working on: ${job.displayName}');
-
-      // Resolve and validate target directory
-      final folderDir = Directory(job.folderPath);
-      if (!await _hasWriteAccess(folderDir)) {
-        _toast('No write access to: ${job.displayName}');
-        _log('No write access to: ${job.displayName}');
-      }
-      if (!await folderDir.exists()) {
-        _toast('Folder missing: ${job.displayName}');
-        _log('Folder missing: ${job.displayName}');
-        job.status = JobStatus.completed; // nothing to do
+      final pathEntity = pathById[job.folderPath];
+      if (pathEntity == null) {
+        _log('Album missing for job ${job.displayName} (${job.folderPath})');
+        job.status = JobStatus.completed;
         await _storage.saveJobs(jobs);
         continue;
       }
 
-      // Prescan original sizes across the tree (authoritative total)
-      await _prescanOriginalSizesRecursively(folderDir, job);
+      job.status = JobStatus.inProgress;
+      await ForegroundNotifier.update(
+        title: 'Squeezing ${job.displayName}',
+        text: keepOriginal ? '' : _buildNotificationText(job),
+      );
+      await _storage.saveJobs(jobs);
+
+      _log('Working on album: ${job.displayName} (id=${pathEntity.id})');
+
+      // Index assets for this album (oldest → newest).
+      await _indexAssetsForJob(pathEntity, job);
       await _storage.saveJobs(jobs);
 
       await ForegroundNotifier.update(
         title: 'Squeezing ${_composeDisplayTitle(job)}',
-        text: keepOriginal
-            ? ""
-            : _buildNotificationText(
-                job), // completed status is currently unsupported if keeping original files,
+        text: keepOriginal ? '' : _buildNotificationText(job),
       );
 
       // Main file-processing loop
@@ -136,37 +118,51 @@ class CompressionManager {
           continue;
         }
 
-        // Choose next unprocessed file
-        final next = await _findNextVideoRecursively(folderDir, job);
-        if (next == null) {
+        final asset = await _findNextAssetForJob(job);
+        if (asset == null) {
           job.status = JobStatus.completed;
           await _storage.saveJobs(jobs);
-          _log('Folder completed: ${job.displayName}');
+          _log('Album completed: ${job.displayName}');
           break;
         }
 
-        job.currentFilePath = next.path;
+        // Label current file in UI (just the title/filename).
+        job.currentFilePath = asset.title ?? 'Video';
         await _storage.saveJobs(jobs);
         await ForegroundNotifier.update(
           title: 'Squeezing ${_composeDisplayTitle(job)}',
-          text: keepOriginal
-              ? ""
-              : _buildNotificationText(
-                  job), // completed status is currently unsupported if keeping original files,
+          text: keepOriginal ? '' : _buildNotificationText(job),
         );
+
+        // Storage-space check before each compression step.
+        await _checkStorageAndWarnIfLow(jobs);
+
+        final file = await asset.file;
+        if (file == null) {
+          _log('Asset file is null for id=${asset.id}, skipping.');
+          // Mark as done with size 0 to avoid infinite loops.
+          job.completedSizes[asset.id] = job.completedSizes[asset.id] ?? 0;
+          job.fileIndex[asset.id] = FileState(
+            originalBytes:
+                job.fileIndex[asset.id]?.originalBytes ?? 0, // keep old size
+            compressed: true,
+          );
+          job.totalBytes = job.mappedTotalBytes;
+          job.processedBytes = job.mappedCompressedBytes;
+          await _storage.saveJobs(jobs);
+          continue;
+        }
 
         final videoProcessor = VideoProcessor();
 
-        // Kick off FFmpeg and retain session id for cancellation
         final handle = await videoProcessor.reencodeH264AacAsync(
-          next,
-          outputDirPath: job.folderPath,
-          labelSuffix: suffix, // pure naming; detection is not based on this
+          file,
+          outputDirPath: file.parent.path,
+          labelSuffix: suffix,
           targetCrf: 28,
         );
         _activeFfmpegSessionId = await handle.session.getSessionId();
 
-        // Busy-wait with pause/stop handling
         while (true) {
           if (!_isRunningFlag || _isPausedFlag) {
             final id = _activeFfmpegSessionId;
@@ -176,72 +172,78 @@ class CompressionManager {
             break;
           }
           final rc = await handle.session.getReturnCode();
-          if (rc != null) break; // finished
+          if (rc != null) break;
           await Future<void>.delayed(const Duration(milliseconds: 250));
         }
 
-        // Completion handling
         final rc = await handle.session.getReturnCode();
         if (rc != null && rc.isValueSuccess()) {
-          // 1) Account original size (authoritative)
-          final originalSize = await _tryGetFileSize(next);
-          // Record in both places for backward compat
-          job.completedSizes[next.path] = originalSize;
+          final originalSize = await _tryGetFileSize(file);
 
-// Ensure index has this file with correct size, now marked compressed
-          final prev = job.fileIndex[next.path];
-          job.fileIndex[next.path] = FileState(
+          // Progress accounting.
+          job.completedSizes[asset.id] = originalSize;
+          final prev = job.fileIndex[asset.id];
+          job.fileIndex[asset.id] = FileState(
             originalBytes: prev?.originalBytes ?? originalSize,
             compressed: true,
           );
-
-// Derive progress from mapping
           job.totalBytes = job.mappedTotalBytes;
           job.processedBytes = job.mappedCompressedBytes;
 
-          // 2) If output grew, replace it with the original bytes
+          // 2) If output grew, replace it with the original bytes.
           await _ensureOutputNoBiggerThanInput(
-            input: next,
+            input: file,
             outputPath: handle.outPath,
             inputSize: originalSize,
           );
 
-          // 3) In-place mode (empty suffix) → swap temp into original
-          if (suffix.trim().isEmpty) {
-            await _commitTempOverOriginal(
-              tempPath: handle.outPath,
-              original: next,
-              job: job,
+          final compressedFile = File(handle.outPath);
+
+          if (suffix.trim().isEmpty && !keepOriginal) {
+            // In-place semantics, but we postpone the destructive delete
+            // until the user taps "Clear old files" in the UI.
+            //
+            // Here we only record:
+            //  - original path (where the final file should live),
+            //  - temp compressed path,
+            //  - bytes & assetId.
+            final item = TrashItem(
+              originalPath: file.path,
+              trashedPath: compressedFile.path,
+              bytes: originalSize,
+              trashedAt: DateTime.now(),
+              assetId: asset.id,
             );
+            await _storage.addTrashItem(item);
+
+            // For bookkeeping, record that we have a compressed representation.
+            job.compressedPaths.add(compressedFile.path);
           } else {
-            // Separate output file (normal case)
+            // Suffix mode or explicit "keep originals": keep compressed file
+            // as a separate path on disk and do NOT schedule any deletion.
             job.compressedPaths.add(handle.outPath);
           }
 
-          // 4) Optional: move/delete original if keeping is disabled (suffix mode only)
-          if (suffix.trim().isNotEmpty && !keepOriginal) {
-            await TrashHelper.trash(next);
-          }
-
           await _storage.saveJobs(jobs);
-          _log('Finished: ${next.path}');
+          _log('Finished: asset=${asset.id} (${job.currentFilePath})');
 
           await ForegroundNotifier.update(
             title: 'Squeezing ${_composeDisplayTitle(job)}',
-            text: keepOriginal
-                ? ""
-                : _buildNotificationText(
-                    job), // completed status is currently unsupported if keeping original files,
+            text: keepOriginal ? '' : _buildNotificationText(job),
           );
           await _storage.saveJobs(jobs);
 
-          // 5) Gentle pacing to reduce thermal/IO stress
-          for (int i = 0; i < 300; i++) {
-            if (!_isRunningFlag || _isPausedFlag) break;
-            await Future<void>.delayed(const Duration(seconds: 1));
+          // Gentle pacing — skip if this was the last asset.
+          final isLast = _isLastAssetInJob(job, asset.id);
+
+          if (!isLast) {
+            for (int i = 0; i < 3; i++) {
+              if (!_isRunningFlag || _isPausedFlag) break;
+              await Future<void>.delayed(const Duration(seconds: 1));
+            }
           }
         } else {
-          // Error handling: try to capture logs or at least an exception string
+          // Error: record logs and mark asset to avoid infinite loop.
           try {
             final allLogs = await handle.session.getAllLogs();
             final output = allLogs.map((e) => e.getMessage()).join('\n');
@@ -258,31 +260,23 @@ class CompressionManager {
           } else if (!_isRunningFlag) {
             break;
           } else {
-            // Mark as “done” with size 0 to avoid infinite retry loops for bad files
-            job.completedSizes[next.path] = job.completedSizes[next.path] ?? 0;
+            job.completedSizes[asset.id] = job.completedSizes[asset.id] ?? 0;
+            final prev = job.fileIndex[asset.id];
+            job.fileIndex[asset.id] = FileState(
+              originalBytes: prev?.originalBytes ?? 0,
+              compressed: true,
+            );
+            job.totalBytes = job.mappedTotalBytes;
+            job.processedBytes = job.mappedCompressedBytes;
             await _storage.saveJobs(jobs);
           }
         }
       }
-      // end while
     }
-    // end for
 
-    // Teardown
-    _isRunningFlag = false;
-    _isPausedFlag = false;
-    _activeFfmpegSessionId = null;
-    await ForegroundNotifier.stop();
-
-    if (!(_stopBarrier?.isCompleted ?? true)) {
-      _stopBarrier!.complete();
-    }
-    _stopBarrier = null;
-
-    _log('Compression STOP (done or stopped)');
+    await _finish();
   }
 
-  /// Temporarily pauses the pipeline. Call [resume] to continue.
   Future<void> pause() async {
     _isPausedFlag = true;
     await ForegroundNotifier.update(
@@ -292,16 +286,12 @@ class CompressionManager {
     _log('PAUSE requested');
   }
 
-  /// Resumes the pipeline if it was previously paused.
   Future<void> resume() async {
     _isPausedFlag = false;
     await ForegroundNotifier.update(text: 'Resumed');
     _log('RESUME');
   }
 
-  /// Requests a stop and waits up to [timeout] for the pipeline to unwind.
-  ///
-  /// If an FFmpeg session is in-flight, it will be cancelled.
   Future<void> stopAndWait(
       {Duration timeout = const Duration(seconds: 5)}) async {
     _isRunningFlag = false;
@@ -312,62 +302,223 @@ class CompressionManager {
     if (id != null) {
       try {
         await FFmpegKit.cancel(id);
-      } catch (_) {
-        // ignore cancellation errors
-      }
+      } catch (_) {}
     }
 
     final future = _stopBarrier?.future;
     if (future != null) {
       try {
         await future.timeout(timeout);
-      } catch (_) {
-        // timeout is acceptable; caller just wanted a best-effort wait
-      }
+      } catch (_) {}
     }
   }
 
-  /// Requests a stop. Alias of [stopAndWait] with default timeout.
   Future<void> stop() => stopAndWait();
 
-  // ---- Private helpers -----------------------------------------------------
+  /// Called from the Status/Settings tab's "Clear old files" button.
+  ///
+  /// IMPORTANT:
+  /// - We only remove references from our "trash" list once we are sure:
+  ///   (1) the original was actually deleted from MediaStore/FS, AND
+  ///   (2) we successfully copied the compressed temp into the original path.
+  ///
+  /// This prevents "user denied deletion" from accidentally wiping our tracking.
+  Future<void> clearOldFiles() async {
+    final items = await _storage.loadTrash();
+    if (items.isEmpty) return;
 
-  void _log(String message) {} //print(message);
+    // 1) Ask Android/MediaStore to delete originals (user may deny).
+    final ids = items
+        .map((e) => e.assetId.trim())
+        .where((id) => id.isNotEmpty)
+        .toList();
+
+    bool deleteCallFailed = false;
+    if (ids.isNotEmpty) {
+      try {
+        // NOTE: Some PhotoManager versions return bool; others throw on failure.
+        // We treat "no throw" as "request issued", but we still verify afterwards.
+        await PhotoManager.editor.deleteWithIds(ids);
+      } catch (e) {
+        deleteCallFailed = true;
+        _log('Failed to delete originals via MediaStore: $e');
+        _toast(
+          'Could not request deletion of old originals. Please try again.',
+        );
+      }
+    }
+
+    // 2) Verify per-item, and only then finalize replacement + remove from trash.
+    final List<TrashItem> stillPending = [];
+
+    for (final item in items) {
+      final tempFile = File(item.trashedPath);
+      final originalFile = File(item.originalPath);
+
+      final tempExists = await _safeExists(tempFile);
+      final originalExists = await _safeExists(originalFile);
+
+      // If the temp file is missing, we cannot finalize.
+      // In this case, we should NOT block the user forever. We prune safely:
+      // - If original still exists: nothing to clear/replace anymore -> drop entry.
+      // - If original is gone too: we can't restore -> drop entry, but warn.
+      if (!tempExists) {
+        if (originalExists) {
+          _log(
+            'Trash item has no temp file but original exists; pruning entry. '
+            'original=${item.originalPath}',
+          );
+          _toast(
+            'An old-file entry was removed because its compressed temp file is missing.',
+          );
+          continue;
+        } else {
+          _log(
+            'Trash item has no temp file and original missing; pruning entry. '
+            'original=${item.originalPath}',
+          );
+          _toast(
+            'An old-file entry was removed because both original and temp files are missing.',
+          );
+          continue;
+        }
+      }
+
+      // If original still exists, user likely denied deletion (or MediaStore failed).
+      // We verify via:
+      // - AssetEntity.fromId (if assetId present)
+      // - and filesystem existence as a fallback.
+      final deleted = await _isOriginalDefinitelyDeleted(item);
+
+      if (!deleted) {
+        // Keep tracking; do NOT copy over existing original.
+        stillPending.add(item);
+        continue;
+      }
+
+      // 3) Original is truly gone -> finalize: put compressed bytes into originalPath.
+      final ok = await _finalizeReplacement(
+        tempFile: tempFile,
+        originalPath: item.originalPath,
+      );
+
+      if (!ok) {
+        // If we couldn't finalize, keep the item so user can retry.
+        stillPending.add(item);
+        continue;
+      }
+
+      // If finalize succeeded, we drop it from trash by NOT adding to stillPending.
+    }
+
+    // 4) Persist the remaining items. (Never blanket-clear unless all truly handled.)
+    await _storage.saveTrash(stillPending);
+
+    // If the delete request failed entirely, keep items (already done), but don't
+    // confuse the user. (The toast above already explains.)
+    if (deleteCallFailed) return;
+  }
+
+  Future<bool> _safeExists(File f) async {
+    try {
+      return await f.exists();
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Returns true only when we're confident the original is gone.
+  ///
+  /// - If assetId is available: we treat `AssetEntity.fromId == null` as deleted.
+  /// - Also uses filesystem existence of originalPath as a backup signal.
+  Future<bool> _isOriginalDefinitelyDeleted(TrashItem item) async {
+    bool assetGone = false;
+    bool pathGone = false;
+
+    // MediaStore verification (best signal)
+    final id = item.assetId.trim();
+    if (id.isNotEmpty) {
+      try {
+        final ent = await AssetEntity.fromId(id);
+        assetGone = (ent == null);
+      } catch (_) {
+        // If we can't query, fall back to filesystem check.
+        assetGone = false;
+      }
+    }
+
+    // Filesystem verification (fallback / additional)
+    try {
+      pathGone = !(await File(item.originalPath).exists());
+    } catch (_) {
+      pathGone = false;
+    }
+
+    // If we have an assetId, prefer that signal, but also accept pathGone.
+    if (id.isNotEmpty) return assetGone || pathGone;
+
+    // If no assetId, we can only trust the filesystem check.
+    return pathGone;
+  }
+
+  /// Copy the temp compressed file into originalPath, then delete temp.
+  /// Returns true only if everything succeeded.
+  Future<bool> _finalizeReplacement({
+    required File tempFile,
+    required String originalPath,
+  }) async {
+    try {
+      // Ensure destination directory exists
+      final parent = Directory(File(originalPath).parent.path);
+      if (!await parent.exists()) {
+        await parent.create(recursive: true);
+      }
+
+      // Copy temp into original path
+      await tempFile.copy(originalPath);
+
+      // Remove temp
+      try {
+        await tempFile.delete();
+      } catch (_) {
+        // Non-fatal, but we’d prefer to keep disk clean.
+      }
+
+      return true;
+    } catch (e) {
+      _log('Failed to finalize replacement to $originalPath: $e');
+      _toast('Failed to finalize a compressed file. Please try again.');
+      return false;
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Internal helpers
+  // ────────────────────────────────────────────────────────────────────────────
+
+  void _log(String message) {
+    // print(message);
+  }
 
   void _toast(String msg) {
     Fluttertoast.showToast(msg: msg, toastLength: Toast.LENGTH_LONG);
   }
 
   String _composeDisplayTitle(FolderJob job) {
-    final current = job.currentFilePath;
-    if (current == null) return job.displayName;
-
-    final parentDirPath = File(current).parent.path;
-    final leafFolder = p.basename(parentDirPath);
-    if (p.equals(parentDirPath, job.folderPath)) return job.displayName;
-
-    return '${job.displayName} > $leafFolder';
+    return job.displayName;
   }
 
   String _buildNotificationText(FolderJob job) {
     final completedFileCount =
-        job.fileIndex.values.where((a) => a.compressed).length.toString();
-    final totalFileCount = job.fileIndex.length.toString();
-    return 'Completed: $completedFileCount / $totalFileCount (${_formatPercent(int.parse(completedFileCount), int.parse(totalFileCount))})';
+        job.fileIndex.values.where((a) => a.compressed).length;
+    final totalFileCount = job.fileIndex.length;
+    return 'Completed: $completedFileCount / $totalFileCount (${_formatPercent(completedFileCount, totalFileCount)})';
   }
 
   String _formatPercent(int done, int total) {
     if (total <= 0) return '0%';
     final pct = (done / total * 100).clamp(0, 100);
     return '${pct.toStringAsFixed(1)}%';
-  }
-
-  bool _looksLikeVideoPath(String path) {
-    final lower = path.toLowerCase();
-    for (final ext in _videoExtensions) {
-      if (lower.endsWith(ext)) return true;
-    }
-    return false;
   }
 
   Future<int> _tryGetFileSize(File f) async {
@@ -378,6 +529,9 @@ class CompressionManager {
     }
   }
 
+  /// If the compressed output is larger than the original, overwrite the
+  /// output with the original bytes so the user never ends up with bigger
+  /// "compressed" files.
   Future<void> _ensureOutputNoBiggerThanInput({
     required File input,
     required String outputPath,
@@ -392,7 +546,9 @@ class CompressionManager {
       final outSize = await outFile.length();
       if (outSize > inputSize) {
         _log(
-            'Output larger than input ($outSize > $inputSize). Replacing output with original bytes.');
+          'Output larger than input ($outSize > $inputSize). '
+          'Replacing output with original bytes.',
+        );
         await outFile.writeAsBytes(await input.readAsBytes(), flush: true);
       }
     } catch (e) {
@@ -400,107 +556,181 @@ class CompressionManager {
     }
   }
 
-  Future<void> _commitTempOverOriginal({
-    required String tempPath,
-    required File original,
-    required FolderJob job,
-  }) async {
-    var pathToUse = tempPath;
-
-    // Guard: never let temp == original
-    if (pathToUse == original.path) {
-      _log('Internal error: temp path equals original');
-      pathToUse += DateTime.now().millisecondsSinceEpoch.toString();
-    }
-
-    try {
-      if (await original.exists()) {
-        await TrashHelper.trash(original);
-      }
-
-      final tempFile = File(pathToUse);
-      if (await tempFile.exists()) {
-        try {
-          await tempFile.rename(original.path);
-          job.compressedPaths.add(original.path);
-          _log('Replaced original with compressed file: ${original.path}');
-        } catch (e) {
-          _log('Rename temp -> original failed: $e');
-          job.compressedPaths.add(pathToUse); // best-effort fallback
-        }
-      } else {
-        _log('Temp file missing: $pathToUse');
-      }
-    } catch (e, st) {
-      _log('In-place replace error: $e\n$st');
-      job.compressedPaths.add(tempPath); // best-effort fallback
-    }
-  }
-
-  Future<void> _prescanOriginalSizesRecursively(
-    Directory root,
+  /// Index all video assets for [pathEntity] into [job.fileIndex], in
+  /// **chronological order (oldest → newest)** so that compressed replacements
+  /// preserve the original age ordering as much as possible.
+  Future<void> _indexAssetsForJob(
+    AssetPathEntity pathEntity,
     FolderJob job,
   ) async {
-    final nextIndex = <String, FileState>{};
+    final List<_AssetMeta> metas = <_AssetMeta>[];
 
     try {
-      await for (final entity
-          in root.list(recursive: true, followLinks: false)) {
-        if (entity is! File) continue;
-        final path = entity.path;
-        if (path.contains('.Trash')) continue;
-        if (!_looksLikeVideoPath(path)) continue;
-
-        // Skip outputs we produced (by absolute path)
-        if (job.compressedPaths.contains(path)) continue;
-
-        final size = await _tryGetFileSize(entity);
-
-        final alreadyCompressed = job.completedSizes.containsKey(path);
-        nextIndex[path] = FileState(
-          originalBytes: size,
-          compressed: alreadyCompressed,
+      final total = await pathEntity.assetCountAsync;
+      const pageSize = 50;
+      for (int start = 0; start < total; start += pageSize) {
+        final end = (start + pageSize) > total ? total : (start + pageSize);
+        final assets = await pathEntity.getAssetListRange(
+          start: start,
+          end: end,
         );
+        for (final asset in assets) {
+          if (asset.type != AssetType.video) continue;
+          final id = asset.id;
+
+          int sizeBytes = 0;
+          try {
+            final f = await asset.file;
+            if (f != null) {
+              sizeBytes = await f.length();
+            }
+          } catch (_) {
+            sizeBytes = 0;
+          }
+
+          final createdAt = asset.createDateTime;
+          metas.add(_AssetMeta(
+            id: id,
+            originalBytes: sizeBytes,
+            createdAt: createdAt,
+          ));
+        }
       }
-    } catch (_) {
-      // ignore traversal errors
+    } catch (e) {
+      _log('Error indexing assets for album ${job.displayName}: $e');
+    }
+
+    // Sort by creation date ascending: oldest → newest.
+    metas.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+
+    final Map<String, FileState> nextIndex = <String, FileState>{};
+    for (final meta in metas) {
+      final alreadyCompressed = job.completedSizes.containsKey(meta.id);
+      nextIndex[meta.id] = FileState(
+        originalBytes: meta.originalBytes,
+        compressed: alreadyCompressed,
+      );
     }
 
     job.fileIndex = nextIndex;
-
-    // Keep legacy counters in sync so UI keeps working.
     job.totalBytes = job.mappedTotalBytes;
     job.processedBytes = job.mappedCompressedBytes;
   }
 
-  Future<File?> _findNextVideoRecursively(Directory root, FolderJob job) async {
-    try {
-      await for (final entity
-          in root.list(recursive: true, followLinks: false)) {
-        if (entity is! File) continue;
-        final path = entity.path;
-        if (path.contains('.Trash')) continue;
-        if (!_looksLikeVideoPath(path)) continue;
-        if (job.compressedPaths.contains(path)) continue; // our outputs
-        final fs = job.fileIndex[path];
-        if (fs != null && fs.compressed) continue; // already done
-        return entity;
+  /// Find the next uncompressed video asset (by id) for this job,
+  /// iterating in the order established by [_indexAssetsForJob]
+  /// (oldest → newest).
+  Future<AssetEntity?> _findNextAssetForJob(FolderJob job) async {
+    for (final entry in job.fileIndex.entries) {
+      final id = entry.key;
+      final fs = entry.value;
+      if (fs.compressed) continue;
+
+      final asset = await AssetEntity.fromId(id);
+      if (asset == null) {
+        // Asset was removed; mark as completed and skip.
+        job.completedSizes[id] = job.completedSizes[id] ?? fs.originalBytes;
+        job.fileIndex[id] = FileState(
+          originalBytes: fs.originalBytes,
+          compressed: true,
+        );
+        job.totalBytes = job.mappedTotalBytes;
+        job.processedBytes = job.mappedCompressedBytes;
+        await _storage.saveJobs(await _storage.loadJobs());
+        continue;
       }
-    } catch (_) {}
+      if (asset.type != AssetType.video) {
+        job.completedSizes[id] = job.completedSizes[id] ?? fs.originalBytes;
+        job.fileIndex[id] = FileState(
+          originalBytes: fs.originalBytes,
+          compressed: true,
+        );
+        job.totalBytes = job.mappedTotalBytes;
+        job.processedBytes = job.mappedCompressedBytes;
+        await _storage.saveJobs(await _storage.loadJobs());
+        continue;
+      }
+      return asset;
+    }
     return null;
   }
 
-  Future<bool> _hasWriteAccess(Directory dir) async {
-    try {
-      final probe = File(
-        p.join(
-            dir.path, '.write_probe_${DateTime.now().microsecondsSinceEpoch}'),
+  /// Compute total bytes left to compress across all jobs.
+  int _bytesLeftAcrossJobs(Map<String, FolderJob> jobs) {
+    var sum = 0;
+    for (final job in jobs.values) {
+      for (final entry in job.fileIndex.entries) {
+        if (!entry.value.compressed) {
+          sum += entry.value.originalBytes;
+        }
+      }
+    }
+    return sum;
+  }
+
+  /// Warn user if free space is < 2x bytes left AND there are originals
+  /// that have already been compressed but not yet cleared by the user.
+  Future<void> _checkStorageAndWarnIfLow(Map<String, FolderJob> jobs) async {
+    if (!Platform.isAndroid) return;
+
+    final freeBytes = await StorageSpaceHelper.getFreeBytes();
+    final bytesLeft = _bytesLeftAcrossJobs(jobs);
+    final hasPendingOldFiles = (await _storage.loadTrash()).isNotEmpty;
+
+    if (bytesLeft <= 0 || !hasPendingOldFiles) return;
+
+    if (freeBytes < bytesLeft * 2) {
+      _toast(
+        'Storage is getting low. Open Squeeze and clear old files.',
       );
-      await probe.writeAsString('ok', flush: true);
-      await probe.delete();
-      return true;
-    } catch (_) {
-      return false;
+      await ForegroundNotifier.update(
+        text: 'Low storage: open Squeeze and clear old files',
+      );
+      for (int i = 0; i < 60 * (bytesLeft * 2 / freeBytes); i++) {
+        await Future<void>.delayed(const Duration(seconds: 1));
+      }
     }
   }
+
+  Future<void> _finish() async {
+    try {
+      final pending = await _storage.loadTrash();
+      if (pending.isNotEmpty) {
+        await ForegroundNotifier.update(
+          title: 'Compression finished',
+          text: 'Tap to clear old files.',
+        );
+      } else {
+        await ForegroundNotifier.update(
+          title: 'Compression finished',
+        );
+      }
+    } catch (_) {
+      // ignore
+    }
+
+    _isRunningFlag = false;
+    _isPausedFlag = false;
+    _activeFfmpegSessionId = null;
+    await ForegroundNotifier.stop();
+
+    if (!(_stopBarrier?.isCompleted ?? true)) {
+      _stopBarrier!.complete();
+    }
+    _stopBarrier = null;
+    _log('Compression STOP (done or stopped)');
+  }
+}
+
+/// Internal metadata holder used when indexing albums.
+class _AssetMeta {
+  final String id;
+  final int originalBytes;
+  final DateTime createdAt;
+
+  _AssetMeta({
+    required this.id,
+    required this.originalBytes,
+    required this.createdAt,
+  });
 }

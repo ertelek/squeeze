@@ -19,25 +19,35 @@ class FileState {
 }
 
 class FolderJob {
-  final String displayName; // e.g., "DCIM"
-  final String folderPath; // full path to the root selected in Settings
+  /// Display name shown in the UI. For MediaStore this is the album/bucket name.
+  final String displayName;
+
+  /// Identifier of the underlying source.
+  ///
+  /// - For MediaStore-based scanning, this is the `AssetPathEntity.id` (album id).
+  /// - Older versions may have persisted an absolute filesystem path.
+  final String folderPath;
+
   final bool recursive;
   JobStatus status;
 
-  // NEW semantics:
-  // - totalBytes = sum of ORIGINAL sizes of all videos found (root + all descendants) at job start
-  // - processedBytes = sum of ORIGINAL sizes of completed videos
   int totalBytes;
   int processedBytes;
 
-  String? currentFilePath; // file being processed or last paused file
+  /// Arbitrary label for the current file (e.g. filename).
+  /// Old persisted data might contain a full path; we only ever display this.
+  String? currentFilePath;
+
   String? errorMessage;
 
-  // NEW: authoritative mapping of *all* videos found => size + compressed flag
-  // Keys are *source* file paths (not outputs).
+  /// Index of all videos for this job. Keys are logical file identifiers:
+  /// - For MediaStore, these are `AssetEntity.id`s.
   Map<String, FileState> fileIndex;
 
+  /// Map of completed file ids → original sizes (bytes).
   Map<String, int> completedSizes;
+
+  /// Set of paths of compressed outputs, kept for backward compatibility.
   Set<String> compressedPaths;
 
   FolderJob({
@@ -55,7 +65,6 @@ class FolderJob {
         completedSizes = completedSizes ?? <String, int>{},
         compressedPaths = compressedPaths ?? <String>{};
 
-  // Helpers to compute totals from the index
   int get mappedTotalBytes =>
       fileIndex.values.fold(0, (a, f) => a + f.originalBytes);
 
@@ -100,6 +109,6 @@ class FolderJob {
   String toJson() => jsonEncode(toMap());
   static FolderJob fromJson(String s) => fromMap(jsonDecode(s));
 
-  static String getPrettyFolderPath(String s) =>
-      s.replaceFirst("/storage/emulated/0", "Internal Storage");
+  /// For legacy UI – now just returns [s] as-is, since [folderPath] is no longer an FS path.
+  static String getPrettyFolderPath(String s) => s;
 }
