@@ -257,7 +257,7 @@ class CompressionManager {
 
           final isLast = _isLastAssetInJob(job, asset.id);
           if (!isLast) {
-            for (int i = 0; i < 3; i++) {
+            for (int i = 0; i < 300; i++) {
               if (!_isRunningFlag || _isPausedFlag) break;
               await Future<void>.delayed(const Duration(seconds: 1));
             }

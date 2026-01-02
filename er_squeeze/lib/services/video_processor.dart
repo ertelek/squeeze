@@ -74,18 +74,64 @@ class VideoProcessor {
     return ext.isEmpty ? '.mp4' : ext;
   }
 
-  /// Adds multiple metadata keys to maximize survival across containers.
-  List<String> _metadataTagArgs() {
+  /// Read container/global tags via FFprobe and return a lowercase-keyed map.
+  Future<Map<String, String>> _readTags(File input) async {
+    try {
+      final session = await FFprobeKit.getMediaInformation(input.path);
+      final info = session.getMediaInformation();
+      final tags = info?.getTags();
+      if (tags == null) return const {};
+
+      final out = <String, String>{};
+      for (final e in tags.entries) {
+        final k = e.key.toString().toLowerCase();
+        final v = e.value?.toString();
+        if (v != null && v.trim().isNotEmpty) {
+          out[k] = v;
+        }
+      }
+      return out;
+    } catch (_) {
+      return const {};
+    }
+  }
+
+  /// Append [squeezeTag] to an existing tag value without overwriting it.
+  /// Avoid duplicates and keep it readable.
+  String _appendSqueezeTag(String? existing) {
+    final cur = (existing ?? '').trim();
+
+    // Already contains tag -> keep as-is.
+    if (cur.toLowerCase().contains(squeezeTag)) return cur;
+
+    // If empty -> just the tag.
+    if (cur.isEmpty) return squeezeTag;
+
+    // Choose a separator that tends to survive metadata round-trips.
+    // " | " is readable and common.
+    return '$cur | $squeezeTag';
+  }
+
+  /// Builds -metadata args for multiple fields, preserving existing values
+  /// and appending our marker.
+  Future<List<String>> _metadataTagArgsPreserve(File input) async {
+    final tags = await _readTags(input);
+
+    // FFprobe keys are often lowercase; normalize lookup.
+    final existingComment = tags['comment'];
+    final existingDescription = tags['description'];
+    final existingTitle = tags['title'];
+    final existingEncoder = tags['encoder'];
+
+    final commentOut = _appendSqueezeTag(existingComment);
+    final descriptionOut = _appendSqueezeTag(existingDescription);
+    final titleOut = _appendSqueezeTag(existingTitle);
+
     return <String>[
       '-metadata',
-      'comment=$squeezeTag',
+      'comment=$commentOut',
       '-metadata',
-      'description=$squeezeTag',
-      '-metadata',
-      'title=$squeezeTag',
-      // encoder is commonly surfaced by tools; harmless if ignored
-      '-metadata',
-      'encoder=squeeze',
+      'description=$descriptionOut',
     ];
   }
 
@@ -95,14 +141,15 @@ class VideoProcessor {
     required String ext,
     required int targetCrf,
     required Map<String, dynamic> audioProps,
+    required List<String> metadataArgs,
   }) {
     final cmd = <String>[
       '-y',
       '-i',
       _quote(input.path),
 
-      // ✅ Tag outputs so we never re-compress
-      ..._metadataTagArgs(),
+      // ✅ Tag outputs so we never re-compress (preserving existing metadata)
+      ...metadataArgs,
     ];
 
     final bool isWebm = ext == '.webm';
@@ -132,8 +179,6 @@ class VideoProcessor {
         targetCrf.toString(),
         '-pix_fmt',
         'yuv420p',
-
-        // ✅ Always re-encode audio (AAC is inherently lossy; we mitigate w/ bitrate)
         '-c:a',
         'aac',
         '-b:a',
@@ -147,22 +192,16 @@ class VideoProcessor {
         cmd.addAll(['-ar', audioProps['sample_rate'].toString()]);
       }
 
-      // For MP4/MOV: faststart helps playback.
       if (ext == '.mp4' || ext == '.m4v' || ext == '.mov') {
         cmd.addAll(['-movflags', '+faststart']);
       }
-
-      // Some containers don’t like global metadata unless you force it:
-      // Keeping it simple for now; FFmpeg will ignore unsupported tags.
     }
 
-    // Let muxer infer from extension
     cmd.add(_quote(outPath));
     return cmd;
   }
 
-  Future<({dynamic session, File tempFile, String ext})>
-      encodeToTempSameContainer(
+  Future<({dynamic session, File tempFile, String ext})> encodeToTempSameContainer(
     File input, {
     int targetCrf = 28,
   }) async {
@@ -177,12 +216,16 @@ class VideoProcessor {
 
     final audioProps = await _probeAudioProps(input);
 
+    // ✅ Read existing metadata and append to it
+    final metadataArgs = await _metadataTagArgsPreserve(input);
+
     final cmd = _buildCmd(
       input: input,
       outPath: tempPath,
       ext: ext,
       targetCrf: targetCrf,
       audioProps: audioProps,
+      metadataArgs: metadataArgs,
     );
 
     _log('FFmpeg: ${cmd.join(' ')}');
