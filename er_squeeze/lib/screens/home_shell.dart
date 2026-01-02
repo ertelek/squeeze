@@ -7,7 +7,8 @@ import '../services/compression_manager.dart';
 import '../models/job_status.dart';
 
 class HomeShell extends StatefulWidget {
-  const HomeShell({super.key});
+  const HomeShell({super.key, this.initialTabIndex});
+  final int? initialTabIndex;
   @override
   State<HomeShell> createState() => _HomeShellState();
 }
@@ -44,12 +45,14 @@ class _HomeShellState extends State<HomeShell> {
   }
 
   Future<void> _decideInitialTab() async {
-    if (_mgr.isRunning) {
+    if (widget.initialTabIndex != null) {
+      _index = widget.initialTabIndex!;
+    } else if (_mgr.isRunning) {
       _index = 0;
     } else {
       final opts = await _storage.loadOptions();
-      final selected =
-          (opts['selectedFolders'] as List?)?.cast<String>() ?? const <String>[];
+      final selected = (opts['selectedFolders'] as List?)?.cast<String>() ??
+          const <String>[];
       _index = selected.isEmpty ? 1 : 0;
     }
 

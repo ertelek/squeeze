@@ -2,7 +2,7 @@ name: er_squeeze
 description: "Compress videos on your phone to save space without losing quality!"
 publish_to: 'none'
 
-version: 1.0.0+6
+version: 1.0.0+7
 
 environment:
   sdk: ^3.5.4
@@ -22,6 +22,7 @@ dependencies:
   ffmpeg_kit_flutter_new: ^3.2.0
   package_info_plus: ^9.0.0
   url_launcher: ^6.3.2
+  video_player: ^2.9.2
 
   # NEW: MediaStore-based video access
   photo_manager: ^3.8.3
@@ -39,3 +40,5 @@ flutter_launcher_icons:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/onboarding/
