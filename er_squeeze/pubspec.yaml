@@ -2,7 +2,7 @@ name: er_squeeze
 description: "Compress videos on your phone to save space without losing quality!"
 publish_to: 'none'
 
-version: 1.0.0+5
+version: 1.0.0+6
 
 environment:
   sdk: ^3.5.4
