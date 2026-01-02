@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
+import 'package:flutter/services.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
@@ -24,10 +25,18 @@ class CompressionManager {
 
   final StorageService _storage = StorageService();
 
+  // ✅ MediaScanner channel (Android only)
+  static const MethodChannel _mediaScannerChannel =
+      MethodChannel('er_squeeze/media_scanner');
+
   bool _isRunningFlag = false;
   bool _isPausedFlag = false;
   int? _activeFfmpegSessionId;
   Completer<void>? _stopBarrier;
+
+  // ✅ Track current encode so pause/stop can clean up correctly.
+  File? _activeTempFile;
+  String? _activeAssetId; // informational + debugging (and future use)
 
   bool get isRunning => _isRunningFlag;
   bool get isPaused => _isPausedFlag;
@@ -71,7 +80,6 @@ class CompressionManager {
     );
 
     // ✅ If LIMITED access, do not start.
-    // We need full access to reliably read/write and save compressed outputs.
     if (ps == PermissionState.limited) {
       _toast(
         'Please grant full media access in Settings to start compression.',
@@ -92,9 +100,8 @@ class CompressionManager {
     final keepOriginal = (options['keepOriginal'] ?? false) as bool;
 
     // Preload albums map: album id → AssetPathEntity
-    final allPaths = await PhotoManager.getAssetPathList(
-      type: RequestType.video,
-    );
+    final allPaths =
+        await PhotoManager.getAssetPathList(type: RequestType.video);
     final Map<String, AssetPathEntity> pathById = {
       for (final pth in allPaths) pth.id: pth,
     };
@@ -179,15 +186,22 @@ class CompressionManager {
         // ✅ Encode to app-private temp file, preserving container/extension
         final handle = await videoProcessor.encodeToTempSameContainer(
           file,
-          targetCrf: 28,
+          targetCrf: 23,
         );
-        _activeFfmpegSessionId = await handle.session.getSessionId();
 
+        // ✅ Track active session + temp file so pause can clean it up.
+        _activeFfmpegSessionId = await handle.session.getSessionId();
+        _activeTempFile = handle.tempFile;
+        _activeAssetId = asset.id;
+
+        // Wait until success/fail/cancel OR pause/stop triggers cancel.
         while (true) {
           if (!_isRunningFlag || _isPausedFlag) {
             final id = _activeFfmpegSessionId;
             if (id != null) {
-              await FFmpegKit.cancel(id);
+              try {
+                await FFmpegKit.cancel(id);
+              } catch (_) {}
             }
             break;
           }
@@ -197,10 +211,32 @@ class CompressionManager {
         }
 
         final rc = await handle.session.getReturnCode();
+
+        // ✅ If we paused/stopped (or got a cancel return code), cleanup and DO NOT
+        // mark the asset completed.
+        final bool interrupted =
+            !_isRunningFlag || _isPausedFlag || (rc != null && rc.isValueCancel());
+
+        if (interrupted) {
+          // Best-effort: delete partial temp output so pause doesn't leak storage.
+          await videoProcessor.discardTemp(handle.tempFile);
+
+          // Clear active tracking
+          _activeFfmpegSessionId = null;
+          _activeTempFile = null;
+          _activeAssetId = null;
+
+          // If stop was requested, break out.
+          if (!_isRunningFlag) break;
+
+          // If paused, loop will idle at top until resume.
+          continue;
+        }
+
+        // ✅ Success path
         if (rc != null && rc.isValueSuccess()) {
           final originalSize = await videoProcessor.safeLength(file);
-          final compressedSize =
-              await videoProcessor.safeLength(handle.tempFile);
+          final compressedSize = await videoProcessor.safeLength(handle.tempFile);
 
           // ✅ If output is not smaller: discard and keep original
           final smaller =
@@ -209,6 +245,10 @@ class CompressionManager {
             await videoProcessor.discardTemp(handle.tempFile);
             _markAssetDone(job, asset.id, originalSize);
             await _storage.saveJobs(jobs);
+
+            _activeFfmpegSessionId = null;
+            _activeTempFile = null;
+            _activeAssetId = null;
             continue;
           }
 
@@ -244,6 +284,10 @@ class CompressionManager {
 
             await handle.tempFile.copy(finalOut);
             await videoProcessor.discardTemp(handle.tempFile);
+
+            // ✅ Make Gallery see it (best-effort)
+            await _scanFileIfAndroid(finalOut);
+
             job.compressedPaths.add(finalOut);
           }
 
@@ -255,6 +299,11 @@ class CompressionManager {
             text: keepOriginal ? '' : _buildNotificationText(job),
           );
 
+          // Clear active tracking
+          _activeFfmpegSessionId = null;
+          _activeTempFile = null;
+          _activeAssetId = null;
+
           final isLast = _isLastAssetInJob(job, asset.id);
           if (!isLast) {
             for (int i = 0; i < 300; i++) {
@@ -263,6 +312,7 @@ class CompressionManager {
             }
           }
         } else {
+          // Error (non-cancel): record logs and mark asset to avoid infinite loop.
           try {
             final allLogs = await handle.session.getAllLogs();
             final output = allLogs.map((e) => e.getMessage()).join('\n');
@@ -273,8 +323,14 @@ class CompressionManager {
 
           await videoProcessor.discardTemp(handle.tempFile);
 
+          // Mark done so we don't spin forever on a bad asset.
           _markAssetDone(job, asset.id, 0);
           await _storage.saveJobs(jobs);
+
+          // Clear active tracking
+          _activeFfmpegSessionId = null;
+          _activeTempFile = null;
+          _activeAssetId = null;
 
           if (_isPausedFlag) {
             while (_isPausedFlag && _isRunningFlag) {
@@ -303,6 +359,30 @@ class CompressionManager {
 
   Future<void> pause() async {
     _isPausedFlag = true;
+
+    // ✅ Cancel current ffmpeg session (if any)
+    final id = _activeFfmpegSessionId;
+    if (id != null) {
+      try {
+        await FFmpegKit.cancel(id);
+      } catch (_) {}
+    }
+
+    // ✅ Delete incomplete temp output (if any)
+    final tmp = _activeTempFile;
+    if (tmp != null) {
+      try {
+        if (await tmp.exists()) {
+          await tmp.delete();
+        }
+      } catch (_) {}
+    }
+
+    // ✅ Clear active tracking; IMPORTANT: we do NOT mark any asset "done" here.
+    _activeFfmpegSessionId = null;
+    _activeTempFile = null;
+    _activeAssetId = null;
+
     await ForegroundNotifier.update(
       text:
           'Paused • ${DateTime.now().toLocal().toString().split(' ')[1].substring(0, 8)}',
@@ -316,8 +396,7 @@ class CompressionManager {
     _log('RESUME');
   }
 
-  Future<void> stopAndWait(
-      {Duration timeout = const Duration(seconds: 5)}) async {
+  Future<void> stopAndWait({Duration timeout = const Duration(seconds: 5)}) async {
     _isRunningFlag = false;
     _isPausedFlag = false;
     _log('STOP requested');
@@ -328,6 +407,20 @@ class CompressionManager {
         await FFmpegKit.cancel(id);
       } catch (_) {}
     }
+
+    // Best-effort cleanup of temp file on stop as well.
+    final tmp = _activeTempFile;
+    if (tmp != null) {
+      try {
+        if (await tmp.exists()) {
+          await tmp.delete();
+        }
+      } catch (_) {}
+    }
+
+    _activeFfmpegSessionId = null;
+    _activeTempFile = null;
+    _activeAssetId = null;
 
     final future = _stopBarrier?.future;
     if (future != null) {
@@ -344,7 +437,7 @@ class CompressionManager {
   /// Deletes originals via MediaStore (user-confirmed) and then copies the temp
   /// compressed bytes back into the original path.
   ///
-  /// ✅ No recycle-bin logic here: we just request deletion via deleteWithIds.
+  /// ✅ After copying, we call MediaScanner so Gallery picks it up.
   Future<void> clearOldFiles() async {
     // ✅ Start from validated list so we don't ask for deletion if temp outputs vanished.
     final items = await _storage.loadTrashValidated();
@@ -363,8 +456,7 @@ class CompressionManager {
       } catch (e) {
         deleteCallFailed = true;
         _log('Failed to delete originals via MediaStore: $e');
-        _toast(
-            'Could not delete old videos. Please try again.');
+        _toast('Could not delete old videos. Please try again.');
       }
     }
 
@@ -375,10 +467,8 @@ class CompressionManager {
       final tempFile = File(item.trashedPath);
 
       final tempExists = await _safeExists(tempFile);
-
       if (!tempExists) {
-        // Temp missing: can't finalize, drop it (and validation will keep list clean).
-        continue;
+        continue; // can't finalize
       }
 
       final deleted = await _isOriginalDefinitelyDeleted(item);
@@ -444,8 +534,13 @@ class CompressionManager {
         await parent.create(recursive: true);
       }
 
+      // Copy temp bytes into original path
       await tempFile.copy(originalPath);
 
+      // ✅ Tell Android to index this new file so Gallery shows it.
+      await _scanFileIfAndroid(originalPath);
+
+      // Delete temp (best-effort)
       try {
         await tempFile.delete();
       } catch (_) {}
@@ -455,6 +550,16 @@ class CompressionManager {
       _log('Failed to finalize replacement to $originalPath: $e');
       _toast('Failed to save a compressed file. Please try again.');
       return false;
+    }
+  }
+
+  Future<void> _scanFileIfAndroid(String path) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _mediaScannerChannel.invokeMethod<void>('scanFile', {'path': path});
+    } catch (e) {
+      // Non-fatal: file exists; gallery may update later.
+      _log('Media scan failed for $path: $e');
     }
   }
 
@@ -538,6 +643,9 @@ class CompressionManager {
     _isRunningFlag = false;
     _isPausedFlag = false;
     _activeFfmpegSessionId = null;
+    _activeTempFile = null;
+    _activeAssetId = null;
+
     await ForegroundNotifier.stop();
 
     if (!(_stopBarrier?.isCompleted ?? true)) {
@@ -558,26 +666,21 @@ class CompressionManager {
       const pageSize = 50;
       for (int start = 0; start < total; start += pageSize) {
         final end = (start + pageSize) > total ? total : (start + pageSize);
-        final assets = await pathEntity.getAssetListRange(
-          start: start,
-          end: end,
-        );
+        final assets =
+            await pathEntity.getAssetListRange(start: start, end: end);
         for (final asset in assets) {
           if (asset.type != AssetType.video) continue;
-          final id = asset.id;
 
           int sizeBytes = 0;
           try {
             final f = await asset.file;
-            if (f != null) {
-              sizeBytes = await f.length();
-            }
+            if (f != null) sizeBytes = await f.length();
           } catch (_) {
             sizeBytes = 0;
           }
 
           metas.add(_AssetMeta(
-            id: id,
+            id: asset.id,
             originalBytes: sizeBytes,
             createdAt: asset.createDateTime,
           ));
