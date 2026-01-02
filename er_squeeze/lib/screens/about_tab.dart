@@ -2,6 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../services/storage.dart';
+import 'onboarding_screen.dart';
+
 class AboutTab extends StatefulWidget {
   const AboutTab({super.key});
   @override
@@ -85,7 +88,8 @@ FFmpeg Kit (and the FFmpeg binaries it bundles in the GPL variant) are licensed 
 Source code and license details are available from the FFmpeg Kit project and FFmpeg upstream.
 See https://github.com/sk3llo/ffmpeg_kit_flutter/blob/master/LICENSE
 ''',
-                url: 'https://github.com/sk3llo/ffmpeg_kit_flutter/blob/master/LICENSE',
+                url:
+                    'https://github.com/sk3llo/ffmpeg_kit_flutter/blob/master/LICENSE',
               ),
               LicenseCard(
                 title: 'FFmpeg',
@@ -128,6 +132,7 @@ You can view those licenses via the license screen below.
             ],
           ),
           const SizedBox(height: 8),
+          const SizedBox(height: 8),
           OutlinedButton.icon(
             onPressed: () {
               showLicensePage(
@@ -140,6 +145,26 @@ You can view those licenses via the license screen below.
             },
             icon: const Icon(Icons.article_outlined),
             label: const Text('View Dart/Flutter package licenses'),
+          ),
+          OutlinedButton.icon(
+            icon: const Icon(Icons.replay),
+            label: const Text('Replay onboarding'),
+            onPressed: () async {
+              final storage = StorageService();
+              await storage.saveOnboardingSeen(false);
+
+              if (!context.mounted) return;
+
+              await Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => OnboardingScreen(
+                    onDone: ({required bool goToSettings}) {
+                      Navigator.of(context).pop(); // close onboarding
+                    },
+                  ),
+                ),
+              );
+            },
           ),
         ],
       ),

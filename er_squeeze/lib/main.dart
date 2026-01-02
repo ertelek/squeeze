@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'screens/home_shell.dart';
+import 'screens/app_entry.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -14,9 +14,10 @@ class App extends StatelessWidget {
       title: 'Squeeze!',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-          colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
-          useMaterial3: true),
-      home: const HomeShell(),
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
+        useMaterial3: true,
+      ),
+      home: const AppEntry(),
     );
   }
 }

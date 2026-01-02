@@ -120,12 +120,9 @@ class VideoProcessor {
     // FFprobe keys are often lowercase; normalize lookup.
     final existingComment = tags['comment'];
     final existingDescription = tags['description'];
-    final existingTitle = tags['title'];
-    final existingEncoder = tags['encoder'];
 
     final commentOut = _appendSqueezeTag(existingComment);
     final descriptionOut = _appendSqueezeTag(existingDescription);
-    final titleOut = _appendSqueezeTag(existingTitle);
 
     return <String>[
       '-metadata',
@@ -160,7 +157,7 @@ class VideoProcessor {
         '-c:v',
         'libvpx-vp9',
         '-crf',
-        '27',
+        '28',
         '-b:v',
         '0',
         '-c:a',
@@ -203,7 +200,7 @@ class VideoProcessor {
 
   Future<({dynamic session, File tempFile, String ext})> encodeToTempSameContainer(
     File input, {
-    int targetCrf = 28,
+    int targetCrf = 23, // This is crucial for this app
   }) async {
     final tempDir = await _getTempDir();
     final ext = _inputExt(input);

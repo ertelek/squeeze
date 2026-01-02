@@ -159,4 +159,22 @@ class StorageService {
     m['trash'] = <dynamic>[];
     await writeAll(m);
   }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Onboarding
+  // ────────────────────────────────────────────────────────────────────────────
+
+  Future<bool> loadOnboardingSeen() async {
+    final opts = await loadOptions();
+    return (opts['onboardingSeen'] ?? false) as bool;
+  }
+
+  Future<void> saveOnboardingSeen(bool seen) async {
+    await saveOptions(); // ensures file exists
+    final m = await readAll();
+    final o = Map<String, dynamic>.from(m['options'] ?? {});
+    o['onboardingSeen'] = seen;
+    m['options'] = o;
+    await writeAll(m);
+  }
 }
