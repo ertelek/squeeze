@@ -23,9 +23,8 @@ All of this happens **locally**; the App does not transmit your files outside yo
 ## 3) Permissions we request and why
 Depending on your Android version and choices, the App may request:
 
-- **All files access / Manage external storage**  
-  Purpose: Allow reading and writing across your internal storage to locate and compress videos.  
-  Your choice: You can decline, or grant only when using selected folders. Without this, some features may not work.
+- **Photos and Videos**  
+  Purpose: Allow reading and writing photos and videos to locate and compress videos. Without this, some features may not work.
 
 - **Notifications**  
   Purpose: Show progress, pause/resume, and completion status during background compression.
