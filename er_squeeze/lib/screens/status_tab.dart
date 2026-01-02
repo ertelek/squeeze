@@ -23,10 +23,12 @@ class StatusTabState extends State<StatusTab> {
   bool _showPct = true;
 
   int _oldCount = 0;
-  int _oldBytes = 0;
+  int _oldOriginalBytes = 0;
+  int _oldCompressedBytes = 0;
+  int _oldReclaimableBytes = 0;
+
   int _freeBytes = 0;
 
-  // ✅ NEW: initial loading gate
   bool _isInitialLoading = true;
 
   @override
@@ -39,6 +41,7 @@ class StatusTabState extends State<StatusTab> {
       (_) {
         if (mounted) {
           refreshJobs();
+          setState(() {});
         }
       },
     );
@@ -69,26 +72,31 @@ class StatusTabState extends State<StatusTab> {
     await _loadOldFilesStats();
   }
 
-  /// Load "old files" statistics (pending originals) + free space.
   Future<void> _loadOldFilesStats() async {
     int count = 0;
-    int bytes = 0;
+    int origBytes = 0;
+    int compBytes = 0;
 
     try {
-      final List<TrashItem> items = await _storage.loadTrash();
+      // ✅ Validate against filesystem so we don't lie to the user.
+      final List<TrashItem> items = await _storage.loadTrashValidated();
       count = items.length;
       for (final item in items) {
-        bytes += item.bytes;
+        origBytes += item.bytes;
+        compBytes += item.compressedBytes;
       }
     } catch (_) {
       count = 0;
-      bytes = 0;
+      origBytes = 0;
+      compBytes = 0;
     }
 
     final free = await StorageSpaceHelper.getFreeBytes();
 
     _oldCount = count;
-    _oldBytes = bytes;
+    _oldOriginalBytes = origBytes;
+    _oldCompressedBytes = compBytes;
+    _oldReclaimableBytes = (origBytes - compBytes).clamp(0, origBytes);
     _freeBytes = free;
   }
 
@@ -115,7 +123,6 @@ class StatusTabState extends State<StatusTab> {
     return '${v.toStringAsFixed(1)} ${units[i]}';
   }
 
-  /// Top card: always show free space on the device.
   Widget _buildStorageBanner(BuildContext context) {
     final freeStr =
         _freeBytes > 0 ? _formatBytes(_freeBytes) : 'Unknown / not available';
@@ -143,6 +150,10 @@ class StatusTabState extends State<StatusTab> {
   Widget _buildOldFilesBanner(BuildContext context) {
     final hasOldFiles = _oldCount > 0;
 
+    final reclaimStr = _formatBytes(_oldReclaimableBytes);
+    final origStr = _formatBytes(_oldOriginalBytes);
+    final compStr = _formatBytes(_oldCompressedBytes);
+
     return Card(
       color: Theme.of(context).colorScheme.secondaryContainer,
       margin: const EdgeInsets.fromLTRB(4, 0, 4, 12),
@@ -158,19 +169,19 @@ class StatusTabState extends State<StatusTab> {
                   .titleMedium
                   ?.copyWith(fontWeight: FontWeight.w600),
             ),
-            const SizedBox(height: 4),
+            const SizedBox(height: 6),
             Text(
               hasOldFiles
-                  ? 'There ${_oldCount == 1 ? 'is' : 'are'} $_oldCount old '
-                      '${_oldCount == 1 ? 'video' : 'videos'} that can now be deleted '
-                      '(${_formatBytes(_oldBytes)}).\n\n'
-                      'Clearing old files will permanently delete the original '
-                      'versions and keep the compressed versions in their place.'
-                  : 'After compressing, your old files will appear here '
-                      'so you can delete them and free up space.',
+                  ? 'You have $_oldCount old ${_oldCount == 1 ? 'video' : 'videos'} ready.\n\n'
+                      'Squeeze! summary:\n'
+                      '• Original videos: $origStr\n'
+                      '• Compressed videos: $compStr\n'
+                      '• Saved space: $reclaimStr\n\n'
+                      'Clearing old files permanently deletes the originals and keeps the compressed versions.'
+                  : 'After compressing, your old files will appear here so you can delete them and free up space.',
               style: Theme.of(context).textTheme.bodyMedium,
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 10),
             Row(
               children: [
                 ElevatedButton.icon(
@@ -200,8 +211,8 @@ class StatusTabState extends State<StatusTab> {
   Widget build(BuildContext context) {
     if (_isInitialLoading) {
       return Scaffold(
-        appBar: AppBar(title: Text('Status')),
-        body: Center(child: CircularProgressIndicator()),
+        appBar: AppBar(title: const Text('Status')),
+        body: const Center(child: CircularProgressIndicator()),
       );
     }
 
@@ -222,7 +233,6 @@ class StatusTabState extends State<StatusTab> {
             _buildStorageBanner(context),
             _buildOldFilesBanner(context),
             ..._jobs.values.map((job) {
-              final name = job.displayName;
               final completedFileCount =
                   job.fileIndex.values.where((a) => a.compressed).length;
               final totalFileCount = job.fileIndex.length;
@@ -239,7 +249,7 @@ class StatusTabState extends State<StatusTab> {
                     color: _dotColorFor(job),
                     size: 12,
                   ),
-                  title: Text(name),
+                  title: Text(job.displayName),
                   subtitle: (_showPct && job.status != JobStatus.completed)
                       ? Text('${sizePct.toStringAsFixed(1)}%')
                       : null,
@@ -257,7 +267,8 @@ class StatusTabState extends State<StatusTab> {
                   ],
                 ),
               );
-            }).toList(),
+            }),
+            const SizedBox(height: 64),
           ],
         ),
       ),

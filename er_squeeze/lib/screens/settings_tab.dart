@@ -9,7 +9,6 @@ import '../models/job_status.dart';
 import '../services/compression_manager.dart';
 import '../services/storage.dart';
 
-/// Lightweight representation of a video album/bucket from MediaStore.
 class _AlbumInfo {
   final String id;
   final String name;
@@ -29,33 +28,25 @@ class _SettingsTabState extends State<SettingsTab> {
   final _storage = StorageService();
   final _manager = CompressionManager();
 
-  /// Jobs for albums that are currently selected for compression.
   Map<String, FolderJob> _jobs = {};
-
-  /// All video albums discovered on device.
   List<_AlbumInfo> _albums = [];
-
-  /// Set of album ids that the user has checked.
   Set<String> _selectedAlbumIds = <String>{};
 
   final TextEditingController _suffixCtl = TextEditingController();
   bool _keepOriginal = false;
 
-  // Old files tracking (trash)
   int _oldCount = 0;
-  int _oldBytes = 0;
+  int _oldOriginalBytes = 0;
+  int _oldCompressedBytes = 0;
+  int _oldReclaimableBytes = 0;
 
   bool get _hasOldFiles => _oldCount > 0;
 
-  // ✅ NEW: initial loading gate
   bool _isInitialLoading = true;
 
   bool get _shouldDisableStart {
-    if (_manager.isRunning) return false; // allow stopping while running
-
-    // 🔒 Block starting compression if there are old files pending deletion.
+    if (_manager.isRunning) return false;
     if (_hasOldFiles) return true;
-
     if (_selectedAlbumIds.isEmpty) return true;
     if (_keepOriginal && _suffixCtl.text.trim().isEmpty) return true;
     return false;
@@ -82,10 +73,6 @@ class _SettingsTabState extends State<SettingsTab> {
     if (mounted) setState(() => _isInitialLoading = true);
 
     try {
-      // We do this in a safe order:
-      // 1) load albums (permission + MediaStore scan)
-      // 2) load persisted jobs/options
-      // 3) load old files stats
       await _loadAlbumsForSelection();
       await _loadPersistedState();
       await _loadOldFilesStats();
@@ -100,9 +87,8 @@ class _SettingsTabState extends State<SettingsTab> {
       builder: (ctx) => AlertDialog(
         title: const Text('Start compression'),
         content: const Text(
-          'Your original videos will be replaced with compressed versions.\n\n'
-          'The originals will be kept as "old files" which you can '
-          'delete in Squeeze!.',
+          '• Compressing videos will change their order in your Gallery.\n\n'
+          '• If a video has been compressed previously, it will be skipped.',
         ),
         actions: [
           TextButton(
@@ -119,10 +105,6 @@ class _SettingsTabState extends State<SettingsTab> {
     return proceed ?? false;
   }
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // Permissions (Media / Notify)
-  // ────────────────────────────────────────────────────────────────────────────
-
   Future<bool> _ensureMediaPermission() async {
     if (!Platform.isAndroid) return true;
 
@@ -138,7 +120,7 @@ class _SettingsTabState extends State<SettingsTab> {
           title: const Text('Allow access to videos'),
           content: const Text(
             'Squeeze! needs access to your videos in order to compress them. '
-            'Please allow access in the system dialog or app settings.',
+            'To continue, please grant full access to all Photos and Videos.',
           ),
           actions: [
             TextButton(
@@ -159,27 +141,29 @@ class _SettingsTabState extends State<SettingsTab> {
     return false;
   }
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // Old files (trash) stats
-  // ────────────────────────────────────────────────────────────────────────────
-
   Future<void> _loadOldFilesStats() async {
     int count = 0;
-    int bytes = 0;
+    int origBytes = 0;
+    int compBytes = 0;
 
     try {
-      final items = await _storage.loadTrash();
+      // ✅ Validate against filesystem so we don't block if temp outputs are gone.
+      final items = await _storage.loadTrashValidated();
       count = items.length;
       for (final item in items) {
-        bytes += item.bytes;
+        origBytes += item.bytes;
+        compBytes += item.compressedBytes;
       }
     } catch (_) {
       count = 0;
-      bytes = 0;
+      origBytes = 0;
+      compBytes = 0;
     }
 
     _oldCount = count;
-    _oldBytes = bytes;
+    _oldOriginalBytes = origBytes;
+    _oldCompressedBytes = compBytes;
+    _oldReclaimableBytes = (origBytes - compBytes).clamp(0, origBytes);
   }
 
   String _formatBytes(int bytes) {
@@ -197,6 +181,10 @@ class _SettingsTabState extends State<SettingsTab> {
   Widget _buildOldFilesBanner(BuildContext context) {
     if (!_hasOldFiles) return const SizedBox.shrink();
 
+    final reclaimStr = _formatBytes(_oldReclaimableBytes);
+    final origStr = _formatBytes(_oldOriginalBytes);
+    final compStr = _formatBytes(_oldCompressedBytes);
+
     return Card(
       color: Theme.of(context).colorScheme.secondaryContainer,
       margin: const EdgeInsets.fromLTRB(4, 4, 4, 12),
@@ -212,15 +200,18 @@ class _SettingsTabState extends State<SettingsTab> {
                   .titleMedium
                   ?.copyWith(fontWeight: FontWeight.w600),
             ),
-            const SizedBox(height: 4),
+            const SizedBox(height: 6),
             Text(
               'Before starting a new compression run, please clear your old files.\n\n'
               'There ${_oldCount == 1 ? 'is' : 'are'} $_oldCount old '
-              '${_oldCount == 1 ? 'video' : 'videos'} that can now be deleted '
-              '(${_formatBytes(_oldBytes)}).',
+              '${_oldCount == 1 ? 'video' : 'videos'} ready.\n\n'
+              'Squeeze! summary:\n'
+              '• Original videos: $origStr\n'
+              '• Compressed videos: $compStr\n'
+              '• Saved space: $reclaimStr',
               style: Theme.of(context).textTheme.bodyMedium,
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 10),
             Row(
               children: [
                 ElevatedButton.icon(
@@ -243,10 +234,6 @@ class _SettingsTabState extends State<SettingsTab> {
     await _loadOldFilesStats();
     if (mounted) setState(() {});
   }
-
-  // ────────────────────────────────────────────────────────────────────────────
-  // Loading & persistence
-  // ────────────────────────────────────────────────────────────────────────────
 
   Future<void> _loadPersistedState() async {
     final jobs = await _storage.loadJobs();
@@ -288,10 +275,6 @@ class _SettingsTabState extends State<SettingsTab> {
     await _storage.saveOptions(suffix: '');
     if (mounted) setState(() {});
   }
-
-  // ────────────────────────────────────────────────────────────────────────────
-  // Album discovery & selection (MediaStore)
-  // ────────────────────────────────────────────────────────────────────────────
 
   Future<void> _loadAlbumsForSelection() async {
     final ok = await _ensureMediaPermission();
@@ -383,10 +366,6 @@ class _SettingsTabState extends State<SettingsTab> {
     if (mounted) setState(() {});
   }
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // Start / Stop
-  // ────────────────────────────────────────────────────────────────────────────
-
   Future<void> _onStartStopPressed() async {
     if (_isLocked) {
       _selectedAlbumIds.clear();
@@ -397,13 +376,10 @@ class _SettingsTabState extends State<SettingsTab> {
       if (mounted) setState(() {});
 
       await _manager.stopAndWait();
-
-      // Re-run our initial loads after stopping
       await _runInitialLoad();
       return;
     }
 
-    // Hard stop: must clear old files first
     if (_hasOldFiles) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -539,8 +515,8 @@ class _SettingsTabState extends State<SettingsTab> {
   Widget build(BuildContext context) {
     if (_isInitialLoading) {
       return Scaffold(
-        appBar: AppBar(title: Text('Settings')),
-        body: Center(child: CircularProgressIndicator()),
+        appBar: AppBar(title: const Text('Settings')),
+        body: const Center(child: CircularProgressIndicator()),
       );
     }
 
@@ -554,15 +530,13 @@ class _SettingsTabState extends State<SettingsTab> {
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         children: [
           _buildOldFilesBanner(context),
-
-          // Albums header
           Padding(
             padding: const EdgeInsets.only(bottom: 8),
             child: Row(
               children: [
                 Expanded(
                   child: Text(
-                    'Albums',
+                    'Albums to compress',
                     style: Theme.of(context)
                         .textTheme
                         .titleMedium
@@ -592,7 +566,6 @@ class _SettingsTabState extends State<SettingsTab> {
               ],
             ),
           ),
-
           _disabledWhenLocked(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -603,10 +576,7 @@ class _SettingsTabState extends State<SettingsTab> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text(
-                          'Use the button below to scan for albums '
-                          'on your device.',
-                        ),
+                        const Text('Use the button below to scan for albums.'),
                         const SizedBox(height: 8),
                         ElevatedButton.icon(
                           onPressed: _isLocked
@@ -654,10 +624,7 @@ class _SettingsTabState extends State<SettingsTab> {
               ],
             ),
           ),
-
           _sectionDivider(),
-
-          // Options
           Padding(
             padding: const EdgeInsets.only(bottom: 8),
             child: Row(
@@ -681,12 +648,8 @@ class _SettingsTabState extends State<SettingsTab> {
                       builder: (ctx) => AlertDialog(
                         title: const Text('Keep original files'),
                         content: const Text(
-                          'Squeeze! will keep the original '
-                          'versions of your videos. The compressed copies will be saved '
-                          'with a suffix you choose.\n\n'
-                          '• If this is enabled, you must enter a suffix such as "_compressed".\n\n'
-                          '• If you turn OFF this option, Squeeze! will replace each original '
-                          'video with its compressed version to save space.',
+                          'If enabled, Squeeze will keep originals and save compressed copies with a suffix.\n\n'
+                          'If disabled, Squeeze will replace originals after you clear old files.',
                         ),
                         actions: [
                           TextButton(
@@ -701,7 +664,6 @@ class _SettingsTabState extends State<SettingsTab> {
               ],
             ),
           ),
-
           _disabledWhenLocked(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -758,7 +720,6 @@ class _SettingsTabState extends State<SettingsTab> {
               ],
             ),
           ),
-
           const SizedBox(height: 64),
         ],
       ),

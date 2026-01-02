@@ -24,8 +24,7 @@ class StorageService {
           'keepOriginal': false,
           'selectedFolders': <String>[],
         },
-        // Used now as the list of originals that have been compressed and are
-        // pending deletion ("old files").
+        // List of originals that have been compressed and are pending user action.
         'trash': <dynamic>[],
       }));
     }
@@ -65,10 +64,11 @@ class StorageService {
     return Map<String, dynamic>.from(m['options'] ?? {});
   }
 
-  Future<void> saveOptions(
-      {String? suffix,
-      bool? keepOriginal,
-      List<String>? selectedFolders}) async {
+  Future<void> saveOptions({
+    String? suffix,
+    bool? keepOriginal,
+    List<String>? selectedFolders,
+  }) async {
     final m = await readAll();
     final o = Map<String, dynamic>.from(m['options'] ?? {});
     if (suffix != null) o['suffix'] = suffix;
@@ -79,7 +79,7 @@ class StorageService {
   }
 
   // ────────────────────────────────────────────────────────────────────────────
-  // "Old files" persistence (formerly trash)
+  // "Old files" persistence (trash list)
   // ────────────────────────────────────────────────────────────────────────────
 
   Future<List<TrashItem>> loadTrash() async {
@@ -97,8 +97,43 @@ class StorageService {
     await writeAll(m);
   }
 
+  /// ✅ NEW: Load trash items and validate that the temp compressed file still exists.
+  ///
+  /// If the temp file is missing (e.g. app cache cleared / OS eviction),
+  /// we prune the entry so we don't block "Start" or tell the user to clear
+  /// old files when we can't finalize anything.
+  Future<List<TrashItem>> loadTrashValidated({bool persist = true}) async {
+    final items = await loadTrash();
+    if (items.isEmpty) return items;
+
+    final List<TrashItem> kept = [];
+    bool changed = false;
+
+    for (final item in items) {
+      bool tempExists = false;
+      try {
+        tempExists = await File(item.trashedPath).exists();
+      } catch (_) {
+        tempExists = false;
+      }
+
+      if (!tempExists) {
+        changed = true;
+        continue;
+      }
+
+      kept.add(item);
+    }
+
+    if (persist && changed) {
+      await saveTrash(kept);
+    }
+
+    return kept;
+  }
+
   /// Add (or update) an entry representing an original that has been
-  /// successfully compressed and is pending deletion.
+  /// successfully compressed and is pending deletion/finalization.
   Future<void> addTrashItem(TrashItem item) async {
     final items = await loadTrash();
 
