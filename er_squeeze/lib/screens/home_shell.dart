@@ -68,7 +68,7 @@ class _HomeShellState extends State<HomeShell> {
     setState(() => _index = 0);
     _pageController.animateToPage(
       0,
-      duration: const Duration(milliseconds: 10),
+      duration: const Duration(milliseconds: 2000),
       curve: Curves.fastEaseInToSlowEaseOut,
     );
     _statusKey.currentState?.refreshJobs();
@@ -101,7 +101,7 @@ class _HomeShellState extends State<HomeShell> {
           setState(() => _index = i);
           _pageController.animateToPage(
             i,
-            duration: const Duration(milliseconds: 10),
+            duration: const Duration(milliseconds: 2000),
             curve: Curves.fastEaseInToSlowEaseOut,
           );
           if (i == 0) _statusKey.currentState?.refreshJobs();
