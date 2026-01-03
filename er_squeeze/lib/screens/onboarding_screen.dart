@@ -162,48 +162,177 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
   }
 }
 
-class _StepCard extends StatelessWidget {
+class _StepCard extends StatefulWidget {
   const _StepCard({required this.step, required this.isActive});
   final OnboardingStepData step;
   final bool isActive;
+
+  @override
+  State<_StepCard> createState() => _StepCardState();
+}
+
+class _StepCardState extends State<_StepCard> {
+  final ScrollController _scroll = ScrollController();
+  bool _isScrollable = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scroll.addListener(_recalcScrollable);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _recalcScrollable());
+  }
+
+  @override
+  void didUpdateWidget(covariant _StepCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _recalcScrollable());
+  }
+
+  void _recalcScrollable() {
+    if (!_scroll.hasClients) return;
+    final next = _scroll.position.maxScrollExtent > 0;
+    if (next != _isScrollable && mounted) {
+      setState(() => _isScrollable = next);
+    }
+  }
+
+  @override
+  void dispose() {
+    _scroll.removeListener(_recalcScrollable);
+    _scroll.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     const cardRadius = 20.0;
 
-    // ✅ No media: center content vertically in the page/card.
-    if (!step.hasMedia) {
-      return Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 520),
-          child: Card(
-            elevation: 0,
-            color: Colors.white,
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(cardRadius),
-              side: BorderSide(color: cs.outlineVariant),
-            ),
-            clipBehavior: Clip.antiAlias,
-            child: Center(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(24, 28, 24, 28),
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 520),
+        child: LayoutBuilder(
+          builder: (context, viewport) {
+            final viewportHeight = viewport.maxHeight;
+
+            final Widget cardBody = widget.step.hasMedia
+                ? _buildMediaLayout(
+                    context,
+                    viewportHeight: viewportHeight,
+                  )
+                : _buildNoMediaLayout(
+                    context,
+                    viewportHeight: viewportHeight,
+                  );
+
+            return Card(
+              elevation: 0,
+              color: Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(cardRadius),
+                side: BorderSide(color: cs.outlineVariant),
+              ),
+              clipBehavior: Clip.antiAlias,
+              child: Scrollbar(
+                controller: _scroll,
+                thumbVisibility: _isScrollable,
+                child: SingleChildScrollView(
+                  controller: _scroll,
+                  physics: _isScrollable
+                      ? const BouncingScrollPhysics()
+                      : const NeverScrollableScrollPhysics(),
+                  child: ClipRect(
+                    child: InteractiveViewer(
+                      minScale: 1.0,
+                      maxScale: 3.0,
+                      constrained: true,
+                      child: cardBody,
+                    ),
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _buildNoMediaLayout(
+    BuildContext context, {
+    required double viewportHeight,
+  }) {
+    return ConstrainedBox(
+      constraints: BoxConstraints(minHeight: viewportHeight),
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 28, 24, 28),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _IconBubble(icon: widget.step.icon),
+              const SizedBox(height: 14),
+              Text(
+                widget.step.title,
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                widget.step.description,
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      height: 1.35,
+                      color: Colors.black87,
+                    ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMediaLayout(
+    BuildContext context, {
+    required double viewportHeight,
+  }) {
+    // Stable sizing based on viewport height (NOT scroll child constraints).
+    final mediaH = (viewportHeight * 0.62).clamp(200.0, 460.0);
+
+    return ConstrainedBox(
+      // ✅ key fix: center when content < viewport, otherwise allow growth + scrolling
+      constraints: BoxConstraints(minHeight: viewportHeight),
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                height: mediaH,
+                child: _Media(step: widget.step, isActive: widget.isActive),
+              ),
+              const SizedBox(height: 12),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 0),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    _IconBubble(icon: step.icon),
-                    const SizedBox(height: 14),
+                    _IconBubble(icon: widget.step.icon),
+                    const SizedBox(height: 12),
                     Text(
-                      step.title,
+                      widget.step.title,
                       textAlign: TextAlign.center,
-                      style:
-                          Theme.of(context).textTheme.headlineSmall?.copyWith(
-                                fontWeight: FontWeight.w700,
-                              ),
+                      style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                            fontWeight: FontWeight.w700,
+                          ),
                     ),
-                    const SizedBox(height: 8),
+                    const SizedBox(height: 6),
                     Text(
-                      step.description,
+                      widget.step.description,
                       textAlign: TextAlign.center,
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                             height: 1.35,
@@ -213,75 +342,7 @@ class _StepCard extends StatelessWidget {
                   ],
                 ),
               ),
-            ),
-          ),
-        ),
-      );
-    }
-
-    // ✅ Has media: media dominates, text area scrolls if needed.
-    return Center(
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 520),
-        child: Card(
-          elevation: 0,
-          color: Colors.white,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(cardRadius),
-            side: BorderSide(color: cs.outlineVariant),
-          ),
-          clipBehavior: Clip.antiAlias,
-          child: LayoutBuilder(
-            builder: (context, constraints) {
-              final maxH = constraints.maxHeight;
-
-              // Big media, but clamped so it won't overflow on small screens.
-              final mediaH = (maxH * 0.62).clamp(200.0, 460.0);
-
-              return Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  SizedBox(
-                    height: mediaH,
-                    child: _Media(
-                      step: step,
-                      isActive: isActive,
-                    ),
-                  ),
-                  Expanded(
-                    child: SingleChildScrollView(
-                      padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
-                      child: Column(
-                        children: [
-                          _IconBubble(icon: step.icon),
-                          const SizedBox(height: 12),
-                          Text(
-                            step.title,
-                            textAlign: TextAlign.center,
-                            style: Theme.of(context)
-                                .textTheme
-                                .titleLarge
-                                ?.copyWith(fontWeight: FontWeight.w700),
-                          ),
-                          const SizedBox(height: 6),
-                          Text(
-                            step.description,
-                            textAlign: TextAlign.center,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
-                                ?.copyWith(
-                                  height: 1.35,
-                                  color: Colors.black87,
-                                ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
-              );
-            },
+            ],
           ),
         ),
       ),
