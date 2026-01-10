@@ -2,7 +2,7 @@ name: er_squeeze
 description: "Compress videos on your phone to save space without losing quality!"
 publish_to: 'none'
 
-version: 1.0.0+11
+version: 1.0.0+12
 
 environment:
   sdk: ^3.5.4
@@ -42,3 +42,4 @@ flutter:
   uses-material-design: true
   assets:
     - assets/onboarding/
+    - assets/in-app/

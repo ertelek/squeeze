@@ -12,6 +12,11 @@ class StorageService {
 
   File? _file;
 
+  // Album scan cache keys (stored inside "options")
+  static const String _kAlbumCacheTs = 'albumScanCacheTs';
+  static const String _kAlbumCacheAlbums = 'albumScanCacheAlbums';
+  static const String _kAlbumCacheBlocked = 'albumScanCacheBlocked';
+
   Future<File> _ensureFile() async {
     if (_file != null) return _file!;
     final dir = await getApplicationSupportDirectory();
@@ -74,6 +79,75 @@ class StorageService {
     if (suffix != null) o['suffix'] = suffix;
     if (keepOriginal != null) o['keepOriginal'] = keepOriginal;
     if (selectedFolders != null) o['selectedFolders'] = selectedFolders;
+    m['options'] = o;
+    await writeAll(m);
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Album scan cache (albums-to-compress + inaccessible albums + timestamp)
+  // ────────────────────────────────────────────────────────────────────────────
+
+  /// Returns null if no cache exists or it can't be parsed.
+  Future<({
+    DateTime timestamp,
+    List<Map<String, String>> albums,
+    List<Map<String, String>> blocked,
+  })?> loadAlbumScanCache() async {
+    final opts = await loadOptions();
+
+    final tsStr = opts[_kAlbumCacheTs]?.toString();
+    if (tsStr == null || tsStr.trim().isEmpty) return null;
+
+    DateTime ts;
+    try {
+      ts = DateTime.parse(tsStr);
+    } catch (_) {
+      return null;
+    }
+
+    List<Map<String, String>> _parse(dynamic v) {
+      if (v is! List) return <Map<String, String>>[];
+      final out = <Map<String, String>>[];
+      for (final item in v) {
+        if (item is Map) {
+          final id = (item['id'] ?? '').toString();
+          if (id.trim().isEmpty) continue;
+          out.add(<String, String>{
+            'id': id,
+            'name': (item['name'] ?? '').toString(),
+          });
+        }
+      }
+      return out;
+    }
+
+    final albums = _parse(opts[_kAlbumCacheAlbums]);
+    final blocked = _parse(opts[_kAlbumCacheBlocked]);
+
+    return (timestamp: ts, albums: albums, blocked: blocked);
+    // ignore: dead_code
+  }
+
+  Future<void> saveAlbumScanCache({
+    required DateTime timestamp,
+    required List<Map<String, String>> albums,
+    required List<Map<String, String>> blocked,
+  }) async {
+    final m = await readAll();
+    final o = Map<String, dynamic>.from(m['options'] ?? {});
+    o[_kAlbumCacheTs] = timestamp.toIso8601String();
+    o[_kAlbumCacheAlbums] = albums;
+    o[_kAlbumCacheBlocked] = blocked;
+    m['options'] = o;
+    await writeAll(m);
+  }
+
+  Future<void> clearAlbumScanCache() async {
+    final m = await readAll();
+    final o = Map<String, dynamic>.from(m['options'] ?? {});
+    o.remove(_kAlbumCacheTs);
+    o.remove(_kAlbumCacheAlbums);
+    o.remove(_kAlbumCacheBlocked);
     m['options'] = o;
     await writeAll(m);
   }

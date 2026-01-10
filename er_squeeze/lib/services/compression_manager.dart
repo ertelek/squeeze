@@ -5,6 +5,7 @@ import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:flutter/services.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:photo_manager/photo_manager.dart';
 
@@ -25,7 +26,7 @@ class CompressionManager {
 
   final StorageService _storage = StorageService();
 
-  // ✅ MediaScanner channel (Android only)
+  // MediaScanner channel (Android only)
   static const MethodChannel _mediaScannerChannel =
       MethodChannel('er_squeeze/media_scanner');
 
@@ -34,7 +35,7 @@ class CompressionManager {
   int? _activeFfmpegSessionId;
   Completer<void>? _stopBarrier;
 
-  // ✅ Track current encode so pause/stop can clean up correctly.
+  // Track current encode so pause/stop can clean up correctly.
   File? _activeTempFile;
   String? _activeAssetId; // informational + debugging (and future use)
 
@@ -48,6 +49,92 @@ class CompressionManager {
       }
     }
     return true;
+  }
+
+  /// (directory-based core):
+  /// Try writing the bundled test video into [albumDir] using the same
+  /// “copy bytes to destination path + media scan” approach used when
+  /// finalizing replacements, then delete it.
+  ///
+  /// Returns true if the test file existed at the destination after writing.
+  Future<bool> canAccessAlbumDirectory(String albumDir) async {
+    final String filename =
+        'squeeze_album_access_test_${DateTime.now().millisecondsSinceEpoch}.mp4';
+    final String destPath = p.join(albumDir, filename);
+
+    File? tmp;
+    bool exists = false;
+
+    try {
+      final bytes =
+          (await rootBundle.load('assets/in-app/test-album-access.mp4'))
+              .buffer
+              .asUint8List();
+
+      final tempDir = await getTemporaryDirectory();
+      tmp = File(
+        p.join(
+          tempDir.path,
+          'test-album-access_${DateTime.now().millisecondsSinceEpoch}.mp4',
+        ),
+      );
+      await tmp.writeAsBytes(bytes, flush: true);
+
+      // Same semantics as finalize replacement: copy temp bytes to target path
+      await tmp.copy(destPath);
+
+      // Media scan so Gallery/MediaStore can see it (best-effort)
+      await _scanFileIfAndroid(destPath);
+
+      // Small delay can help MediaScanner settle, but not strictly required for exists()
+      await Future<void>.delayed(const Duration(milliseconds: 1000));
+
+      exists = await File(destPath).exists();
+    } catch (_) {
+      exists = false;
+    } finally {
+      // Always try to delete the test file (best effort).
+      try {
+        final f = File(destPath);
+        if (await f.exists()) {
+          await f.delete();
+          await _scanFileIfAndroid(destPath);
+        }
+      } catch (_) {}
+
+      // Clean up temp
+      if (tmp != null) {
+        try {
+          if (await tmp.exists()) await tmp.delete();
+        } catch (_) {}
+      }
+    }
+
+    return exists;
+  }
+
+  /// (album-based wrapper):
+  /// Determine album directory by peeking at one asset file, then call
+  /// [canAccessAlbumDirectory]. If we can’t determine a dir (e.g. empty),
+  /// we return true so we don’t incorrectly mark albums inaccessible.
+  Future<bool> canAccessAlbum(AssetPathEntity album) async {
+    String? albumDir;
+    try {
+      final total = await album.assetCountAsync;
+      if (total <= 0) return true;
+
+      final assets = await album.getAssetListRange(start: 0, end: 1);
+      if (assets.isEmpty) return true;
+
+      final f = await assets.first.file;
+      if (f == null) return true;
+
+      albumDir = Directory(f.parent.path).path;
+    } catch (_) {
+      return true;
+    }
+
+    return canAccessAlbumDirectory(albumDir);
   }
 
   Future<void> start() async {
@@ -79,7 +166,7 @@ class CompressionManager {
       ),
     );
 
-    // ✅ If LIMITED access, do not start.
+    // If LIMITED access, do not start.
     if (ps == PermissionState.limited) {
       _toast(
         'Please grant full media access in Settings to start compression.',
@@ -162,7 +249,7 @@ class CompressionManager {
           text: keepOriginal ? '' : _buildNotificationText(job),
         );
 
-        // ✅ storage warning
+        // storage warning
         await _checkStorageAndWarnIfLow(jobs);
 
         final file = await asset.file;
@@ -173,7 +260,7 @@ class CompressionManager {
           continue;
         }
 
-        // ✅ Skip if already tagged as Squeeze output
+        // Skip if already tagged as Squeeze output
         final alreadyTagged =
             await videoProcessor.isAlreadyCompressedBySqueeze(file);
         if (alreadyTagged) {
@@ -183,13 +270,13 @@ class CompressionManager {
           continue;
         }
 
-        // ✅ Encode to app-private temp file, preserving container/extension
+        // Encode to app-private temp file, preserving container/extension
         final handle = await videoProcessor.encodeToTempSameContainer(
           file,
           targetCrf: 23,
         );
 
-        // ✅ Track active session + temp file so pause can clean it up.
+        // Track active session + temp file so pause can clean it up.
         _activeFfmpegSessionId = await handle.session.getSessionId();
         _activeTempFile = handle.tempFile;
         _activeAssetId = asset.id;
@@ -212,33 +299,26 @@ class CompressionManager {
 
         final rc = await handle.session.getReturnCode();
 
-        // ✅ If we paused/stopped (or got a cancel return code), cleanup and DO NOT
+        // If we paused/stopped (or got a cancel return code), cleanup and DO NOT
         // mark the asset completed.
         final bool interrupted =
             !_isRunningFlag || _isPausedFlag || (rc != null && rc.isValueCancel());
 
         if (interrupted) {
-          // Best-effort: delete partial temp output so pause doesn't leak storage.
           await videoProcessor.discardTemp(handle.tempFile);
 
-          // Clear active tracking
           _activeFfmpegSessionId = null;
           _activeTempFile = null;
           _activeAssetId = null;
 
-          // If stop was requested, break out.
           if (!_isRunningFlag) break;
-
-          // If paused, loop will idle at top until resume.
           continue;
         }
 
-        // ✅ Success path
         if (rc != null && rc.isValueSuccess()) {
           final originalSize = await videoProcessor.safeLength(file);
           final compressedSize = await videoProcessor.safeLength(handle.tempFile);
 
-          // ✅ If output is not smaller: discard and keep original
           final smaller =
               await videoProcessor.isSmallerThanOriginal(file, handle.tempFile);
           if (!smaller) {
@@ -253,7 +333,6 @@ class CompressionManager {
           }
 
           if (!keepOriginal) {
-            // In-place semantics: defer delete+replace until user clears old files.
             final item = TrashItem(
               originalPath: file.path,
               trashedPath: handle.tempFile.path,
@@ -266,14 +345,12 @@ class CompressionManager {
             await _storage.addTrashItem(item);
             job.compressedPaths.add(handle.tempFile.path);
           } else {
-            // Keep-original semantics: create a separate output next to the source.
             final srcExt = handle.ext;
             final stem = p.basenameWithoutExtension(file.path);
             final safeSuffix =
                 suffix.trim().isEmpty ? '_compressed' : suffix.trim();
             final outPath = p.join(file.parent.path, '$stem$safeSuffix$srcExt');
 
-            // Avoid collisions
             var finalOut = outPath;
             int counter = 1;
             while (await File(finalOut).exists()) {
@@ -285,7 +362,6 @@ class CompressionManager {
             await handle.tempFile.copy(finalOut);
             await videoProcessor.discardTemp(handle.tempFile);
 
-            // ✅ Make Gallery see it (best-effort)
             await _scanFileIfAndroid(finalOut);
 
             job.compressedPaths.add(finalOut);
@@ -299,7 +375,6 @@ class CompressionManager {
             text: keepOriginal ? '' : _buildNotificationText(job),
           );
 
-          // Clear active tracking
           _activeFfmpegSessionId = null;
           _activeTempFile = null;
           _activeAssetId = null;
@@ -312,7 +387,6 @@ class CompressionManager {
             }
           }
         } else {
-          // Error (non-cancel): record logs and mark asset to avoid infinite loop.
           try {
             final allLogs = await handle.session.getAllLogs();
             final output = allLogs.map((e) => e.getMessage()).join('\n');
@@ -323,11 +397,9 @@ class CompressionManager {
 
           await videoProcessor.discardTemp(handle.tempFile);
 
-          // Mark done so we don't spin forever on a bad asset.
           _markAssetDone(job, asset.id, 0);
           await _storage.saveJobs(jobs);
 
-          // Clear active tracking
           _activeFfmpegSessionId = null;
           _activeTempFile = null;
           _activeAssetId = null;
@@ -360,7 +432,6 @@ class CompressionManager {
   Future<void> pause() async {
     _isPausedFlag = true;
 
-    // ✅ Cancel current ffmpeg session (if any)
     final id = _activeFfmpegSessionId;
     if (id != null) {
       try {
@@ -368,7 +439,6 @@ class CompressionManager {
       } catch (_) {}
     }
 
-    // ✅ Delete incomplete temp output (if any)
     final tmp = _activeTempFile;
     if (tmp != null) {
       try {
@@ -378,7 +448,6 @@ class CompressionManager {
       } catch (_) {}
     }
 
-    // ✅ Clear active tracking; IMPORTANT: we do NOT mark any asset "done" here.
     _activeFfmpegSessionId = null;
     _activeTempFile = null;
     _activeAssetId = null;
@@ -408,7 +477,6 @@ class CompressionManager {
       } catch (_) {}
     }
 
-    // Best-effort cleanup of temp file on stop as well.
     final tmp = _activeTempFile;
     if (tmp != null) {
       try {
@@ -434,62 +502,116 @@ class CompressionManager {
 
   /// Called from the Status/Settings tab's "Clear old files" button.
   ///
-  /// Deletes originals via MediaStore (user-confirmed) and then copies the temp
-  /// compressed bytes back into the original path.
-  ///
-  /// ✅ After copying, we call MediaScanner so Gallery picks it up.
+  /// Updated behavior:
+  /// - Process albums one-by-one (grouped by originalPath parent directory).
+  /// - Before deleting originals for a group, verify that the album directory is accessible
+  ///   using [canAccessAlbumDirectory] (same test-write mechanism).
+  /// - If inaccessible:
+  ///     • do NOT delete originals in that album dir
+  ///     • show a popup (toast) to the user
+  ///     • delete ONLY the compressed temp versions for that album dir
+  ///     • move on to the next album dir
   Future<void> clearOldFiles() async {
-    // ✅ Start from validated list so we don't ask for deletion if temp outputs vanished.
     final items = await _storage.loadTrashValidated();
     if (items.isEmpty) return;
 
-    // 1) Ask Android/MediaStore to delete originals (user may deny).
-    final ids = items
-        .map((e) => e.assetId.trim())
-        .where((id) => id.isNotEmpty)
-        .toList();
-
-    bool deleteCallFailed = false;
-    if (ids.isNotEmpty) {
+    // Group by album directory (derived from the *originalPath* we’re replacing).
+    final Map<String, List<TrashItem>> byDir = {};
+    for (final item in items) {
+      String dir;
       try {
-        await PhotoManager.editor.deleteWithIds(ids);
-      } catch (e) {
-        deleteCallFailed = true;
-        _log('Failed to delete originals via MediaStore: $e');
-        _toast('Could not delete old videos. Please try again.');
+        dir = File(item.originalPath).parent.path;
+      } catch (_) {
+        dir = '__unknown__';
       }
+      byDir.putIfAbsent(dir, () => <TrashItem>[]).add(item);
     }
 
-    // 2) Verify per-item, finalize replacement, and only then remove from trash.
     final List<TrashItem> stillPending = [];
 
-    for (final item in items) {
-      final tempFile = File(item.trashedPath);
+    for (final entry in byDir.entries) {
+      final albumDir = entry.key;
+      final groupItems = entry.value;
 
-      final tempExists = await _safeExists(tempFile);
-      if (!tempExists) {
-        continue; // can't finalize
-      }
-
-      final deleted = await _isOriginalDefinitelyDeleted(item);
-      if (!deleted) {
-        stillPending.add(item);
+      // Unknown directory -> keep pending (we can’t safely decide).
+      if (albumDir == '__unknown__') {
+        stillPending.addAll(groupItems);
         continue;
       }
 
-      final ok = await _finalizeReplacement(
-        tempFile: tempFile,
-        originalPath: item.originalPath,
-      );
+      final albumName = p.basename(albumDir).isEmpty ? albumDir : p.basename(albumDir);
 
-      if (!ok) {
-        stillPending.add(item);
-        continue;
+      final accessible = await canAccessAlbumDirectory(albumDir);
+
+      if (!accessible) {
+        _toast(
+          'Squeeze! was unable to access the album "$albumName". '
+          'Move the videos from that album to a different album and try again.',
+        );
+
+        // Delete compressed versions for THIS album dir only, keep originals.
+        for (final item in groupItems) {
+          try {
+            final tf = File(item.trashedPath);
+            if (await tf.exists()) {
+              await tf.delete();
+            }
+          } catch (_) {}
+          // Do not keep pending (compressed copies removed).
+        }
+
+        continue; // move to next album dir
+      }
+
+      // Album dir accessible -> delete originals for this group.
+      final ids = groupItems
+          .map((e) => e.assetId.trim())
+          .where((id) => id.isNotEmpty)
+          .toList();
+
+      bool deleteCallFailed = false;
+      if (ids.isNotEmpty) {
+        try {
+          await PhotoManager.editor.deleteWithIds(ids);
+        } catch (e) {
+          deleteCallFailed = true;
+          _log('Failed to delete originals via MediaStore for "$albumName": $e');
+          _toast('Could not delete old videos in "$albumName". Please try again.');
+        }
+      }
+
+      for (final item in groupItems) {
+        final tempFile = File(item.trashedPath);
+
+        final tempExists = await _safeExists(tempFile);
+        if (!tempExists) {
+          continue;
+        }
+
+        if (deleteCallFailed) {
+          stillPending.add(item);
+          continue;
+        }
+
+        final deleted = await _isOriginalDefinitelyDeleted(item);
+        if (!deleted) {
+          stillPending.add(item);
+          continue;
+        }
+
+        final ok = await _finalizeReplacement(
+          tempFile: tempFile,
+          originalPath: item.originalPath,
+        );
+
+        if (!ok) {
+          stillPending.add(item);
+          continue;
+        }
       }
     }
 
     await _storage.saveTrash(stillPending);
-    if (deleteCallFailed) return;
   }
 
   Future<bool> _safeExists(File f) async {
@@ -534,13 +656,10 @@ class CompressionManager {
         await parent.create(recursive: true);
       }
 
-      // Copy temp bytes into original path
       await tempFile.copy(originalPath);
 
-      // ✅ Tell Android to index this new file so Gallery shows it.
       await _scanFileIfAndroid(originalPath);
 
-      // Delete temp (best-effort)
       try {
         await tempFile.delete();
       } catch (_) {}
@@ -558,12 +677,12 @@ class CompressionManager {
     try {
       await _mediaScannerChannel.invokeMethod<void>('scanFile', {'path': path});
     } catch (e) {
-      // Non-fatal: file exists; gallery may update later.
       _log('Media scan failed for $path: $e');
     }
   }
 
   void _log(String message) {
+    // ignore: avoid_print
     // print(message);
   }
 
@@ -604,7 +723,6 @@ class CompressionManager {
     final freeBytes = await StorageSpaceHelper.getFreeBytes();
     final bytesLeft = _bytesLeftAcrossJobs(jobs);
 
-    // ✅ Use validated trash: if temps are gone, don’t warn about “clear old files”.
     final hasPendingOldFiles = (await _storage.loadTrashValidated()).isNotEmpty;
 
     if (freeBytes <= 0 || bytesLeft <= 0 || !hasPendingOldFiles) return;
@@ -626,7 +744,6 @@ class CompressionManager {
 
   Future<void> _finish() async {
     try {
-      // ✅ Only show "Tap to clear old files" if validated temps still exist.
       final pending = await _storage.loadTrashValidated();
       if (pending.isNotEmpty) {
         await ForegroundNotifier.update(

@@ -13,7 +13,14 @@ class _AlbumInfo {
   final String id;
   final String name;
 
-  const _AlbumInfo({required this.id, required this.name});
+  /// Nullable so cached albums can be shown without rescanning PhotoManager.
+  final AssetPathEntity? entity;
+
+  const _AlbumInfo({
+    required this.id,
+    required this.name,
+    this.entity,
+  });
 }
 
 class SettingsTab extends StatefulWidget {
@@ -28,8 +35,16 @@ class _SettingsTabState extends State<SettingsTab> {
   final _storage = StorageService();
   final _manager = CompressionManager();
 
+  // Resets when the app process restarts.
+  // Used only to prevent repeated scans within the same session.
+  static bool _albumCacheLoadedThisSession = false;
+
+  DateTime? _albumCacheTimestamp;
+
   Map<String, FolderJob> _jobs = {};
   List<_AlbumInfo> _albums = [];
+  List<_AlbumInfo> _blockedAlbums = [];
+
   Set<String> _selectedAlbumIds = <String>{};
 
   final TextEditingController _suffixCtl = TextEditingController();
@@ -42,10 +57,14 @@ class _SettingsTabState extends State<SettingsTab> {
 
   bool get _hasOldFiles => _oldCount > 0;
 
-  bool _isInitialLoading = true;
+  // Only album sections show loading spinners
+  bool _isAlbumsLoading = true;
+
+  bool get _isLocked => _manager.isRunning || _manager.isPaused;
 
   bool get _shouldDisableStart {
     if (_manager.isRunning) return false;
+    if (_isAlbumsLoading) return true;
     if (_hasOldFiles) return true;
     if (_selectedAlbumIds.isEmpty) return true;
     if (_keepOriginal && _suffixCtl.text.trim().isEmpty) return true;
@@ -56,6 +75,10 @@ class _SettingsTabState extends State<SettingsTab> {
       'Squeeze! will compress all videos inside the albums you select below.\n\n'
       '• If you select a few albums, only videos in those albums are compressed.\n'
       '• If you select all albums, all videos on your device will be compressed.';
+
+  static const String _inaccessibleAlbumsInfoText =
+      'These albums can’t be accessed by Squeeze due to Android storage restrictions '
+      'or because they belong to other apps.';
 
   @override
   void initState() {
@@ -70,15 +93,94 @@ class _SettingsTabState extends State<SettingsTab> {
   }
 
   Future<void> _runInitialLoad() async {
-    if (mounted) setState(() => _isInitialLoading = true);
+    // 1) Load persisted options/jobs first
+    await _loadPersistedState();
+    if (mounted) setState(() {});
 
-    try {
-      await _loadAlbumsForSelection();
-      await _loadPersistedState();
-      await _loadOldFilesStats();
-    } finally {
-      if (mounted) setState(() => _isInitialLoading = false);
+    // 2) Load old file stats
+    await _loadOldFilesStats();
+    if (mounted) setState(() {});
+
+    // 3) Load cached albums immediately if present
+    await _loadCachedAlbumsIntoUi();
+
+    // 4) Decide whether to refresh
+    final shouldRefresh = _shouldRefreshAlbumCache();
+
+    if (shouldRefresh) {
+      await _loadAlbumsForSelectionStreamingAndSaveCache();
+    } else {
+      if (mounted) setState(() => _isAlbumsLoading = false);
     }
+
+    _albumCacheLoadedThisSession = true;
+  }
+
+  bool _shouldRefreshAlbumCache() {
+    // Rule: If compression run in progress, never refresh.
+    if (_isLocked) return false;
+
+    // ✅ Your rule: refresh if the app was closed and reopened.
+    // That means: on the first Settings load of a new app session, refresh.
+    if (!_albumCacheLoadedThisSession) return true;
+
+    // ✅ Also refresh if more than 1 day has passed since last scan
+    // (only relevant if the app stays open that long, but keep it anyway).
+    if (_albumCacheTimestamp == null) return true;
+    final age = DateTime.now().difference(_albumCacheTimestamp!);
+    return age > const Duration(days: 1);
+  }
+
+  Future<void> _loadCachedAlbumsIntoUi() async {
+    if (mounted) {
+      setState(() {
+        _isAlbumsLoading = true;
+        _albums = [];
+        _blockedAlbums = [];
+      });
+    }
+
+    final cache = await _storage.loadAlbumScanCache();
+
+    if (!mounted) return;
+
+    if (cache == null) {
+      // No cache:
+      // - If locked => do NOT scan => stop spinner to avoid infinite loading
+      // - If not locked => scan will happen next => keep spinner on
+      setState(() {
+        _albumCacheTimestamp = null;
+        _isAlbumsLoading = _isLocked ? false : true;
+      });
+      return;
+    }
+
+    _albumCacheTimestamp = cache.timestamp;
+
+    setState(() {
+      _albums = cache.albums
+          .map((m) => _AlbumInfo(
+                id: m['id'] ?? '',
+                name: m['name'] ?? '',
+                entity: null,
+              ))
+          .where((a) => a.id.trim().isNotEmpty)
+          .toList();
+
+      _blockedAlbums = cache.blocked
+          .map((m) => _AlbumInfo(
+                id: m['id'] ?? '',
+                name: m['name'] ?? '',
+                entity: null,
+              ))
+          .where((a) => a.id.trim().isNotEmpty)
+          .toList();
+
+      _isAlbumsLoading = false;
+    });
+
+    await _pruneBlockedFromSelectionAndPersist();
+    if (mounted) setState(() {});
   }
 
   Future<bool> _confirmOriginalsWillBeDeleted() async {
@@ -147,7 +249,6 @@ class _SettingsTabState extends State<SettingsTab> {
     int compBytes = 0;
 
     try {
-      // ✅ Validate against filesystem so we don't block if temp outputs are gone.
       final items = await _storage.loadTrashValidated();
       count = items.length;
       for (final item in items) {
@@ -257,6 +358,26 @@ class _SettingsTabState extends State<SettingsTab> {
     };
   }
 
+  Future<void> _pruneBlockedFromSelectionAndPersist() async {
+    if (_blockedAlbums.isEmpty) return;
+
+    final blockedIds = _blockedAlbums.map((a) => a.id).toSet();
+    final hadBlockedSelection = _selectedAlbumIds.any(blockedIds.contains);
+    final hadBlockedJobs = _jobs.keys.any(blockedIds.contains);
+
+    if (!hadBlockedSelection && !hadBlockedJobs) return;
+
+    _selectedAlbumIds.removeWhere(blockedIds.contains);
+    _jobs.removeWhere((k, _) => blockedIds.contains(k));
+
+    final persistedJobs = await _storage.loadJobs();
+    for (final bid in blockedIds) {
+      persistedJobs.remove(bid);
+    }
+    await _storage.saveJobs(persistedJobs);
+    await _storage.saveOptions(selectedFolders: _selectedAlbumIds.toList());
+  }
+
   void _resetAllJobsProgress(Map<String, FolderJob> jobs) {
     for (final job in jobs.values) {
       job.processedBytes = 0;
@@ -276,20 +397,74 @@ class _SettingsTabState extends State<SettingsTab> {
     if (mounted) setState(() {});
   }
 
-  Future<void> _loadAlbumsForSelection() async {
+  Future<void> _loadAlbumsForSelectionStreamingAndSaveCache() async {
+    if (_isLocked) return;
+
+    if (mounted) {
+      setState(() {
+        _isAlbumsLoading = true;
+        _albums = [];
+        _blockedAlbums = [];
+      });
+    }
+
     final ok = await _ensureMediaPermission();
     if (!ok) {
-      _albums = [];
+      if (mounted) {
+        setState(() {
+          _isAlbumsLoading = false;
+          _albums = [];
+          _blockedAlbums = [];
+        });
+      }
       return;
     }
 
-    final paths = await PhotoManager.getAssetPathList(
-      type: RequestType.video,
+    final paths = await PhotoManager.getAssetPathList(type: RequestType.video);
+
+    final List<_AlbumInfo> accessible = [];
+    final List<_AlbumInfo> blocked = [];
+
+    for (final path in paths) {
+      if (!mounted) return;
+      if (_isLocked) return;
+
+      final canAccess = await _manager.canAccessAlbum(path);
+      final info = _AlbumInfo(id: path.id, name: path.name, entity: path);
+
+      setState(() {
+        if (!canAccess) {
+          blocked.add(info);
+          _blockedAlbums.add(info);
+        } else {
+          accessible.add(info);
+          _albums.add(info);
+        }
+      });
+    }
+
+    await _pruneBlockedFromSelectionAndPersist();
+
+    if (_isLocked) return;
+
+    final ts = DateTime.now();
+    _albumCacheTimestamp = ts;
+
+    await _storage.saveAlbumScanCache(
+      timestamp: ts,
+      albums: accessible
+          .map((a) => <String, String>{'id': a.id, 'name': a.name})
+          .toList(),
+      blocked: blocked
+          .map((a) => <String, String>{'id': a.id, 'name': a.name})
+          .toList(),
     );
 
-    _albums = paths
-        .map((p) => _AlbumInfo(id: p.id, name: p.name))
-        .toList(growable: false);
+    if (mounted) {
+      setState(() {
+        _isAlbumsLoading = false;
+      });
+    }
   }
 
   Future<void> _indexAllAlbumsJobs() async {
@@ -298,14 +473,10 @@ class _SettingsTabState extends State<SettingsTab> {
     final ok = await _ensureMediaPermission();
     if (!ok) return;
 
-    final paths = await PhotoManager.getAssetPathList(
-      type: RequestType.video,
-    );
-
-    for (final path in paths) {
-      _jobs[path.id] = FolderJob(
-        displayName: path.name,
-        folderPath: path.id,
+    for (final album in _albums) {
+      _jobs[album.id] = FolderJob(
+        displayName: album.name,
+        folderPath: album.id,
         recursive: true,
       );
     }
@@ -319,6 +490,8 @@ class _SettingsTabState extends State<SettingsTab> {
   }
 
   Future<void> _toggleAlbumSelection(_AlbumInfo album, bool selected) async {
+    if (_blockedAlbums.any((a) => a.id == album.id)) return;
+
     if (selected) {
       _selectedAlbumIds.add(album.id);
       _jobs[album.id] = _jobs[album.id] ??
@@ -373,6 +546,8 @@ class _SettingsTabState extends State<SettingsTab> {
       await _storage.saveJobs({});
       await _storage.saveOptions(selectedFolders: []);
       _albums = [];
+      _blockedAlbums = [];
+      _isAlbumsLoading = true;
       if (mounted) setState(() {});
 
       await _manager.stopAndWait();
@@ -427,8 +602,6 @@ class _SettingsTabState extends State<SettingsTab> {
     if (mounted) setState(() {});
   }
 
-  bool get _isLocked => _manager.isRunning || _manager.isPaused;
-
   Widget _disabledWhenLocked({required Widget child}) {
     return Opacity(
       opacity: _isLocked ? 0.5 : 1,
@@ -482,14 +655,148 @@ class _SettingsTabState extends State<SettingsTab> {
     );
   }
 
+  Widget _inlineLoadingRow() {
+    return const Padding(
+      padding: EdgeInsets.symmetric(vertical: 12),
+      child: Row(
+        children: [
+          SizedBox(width: 8),
+          SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2.5),
+          ),
+          SizedBox(width: 12),
+          Text('Loading…'),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAlbumsSectionBody() {
+    final bool allSelected =
+        _albums.isNotEmpty && _selectedAlbumIds.length == _albums.length;
+
+    if (_albums.isEmpty && _isAlbumsLoading) {
+      return _inlineLoadingRow();
+    }
+
+    if (_albums.isEmpty && !_isAlbumsLoading) {
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              _isLocked
+                  ? 'Albums can’t be refreshed while compression is running.'
+                  : 'No albums loaded yet.',
+            ),
+          ],
+        ),
+      );
+    }
+
+    return Column(
+      children: [
+        _selectAllAlbumsRow(
+          allSelected: allSelected,
+          onChanged: (val) async {
+            await _setAllAlbumSelections(val);
+          },
+        ),
+        const SizedBox(height: 4),
+        ..._albums.map(
+          (album) => _albumRow(
+            album: album,
+            selected: _selectedAlbumIds.contains(album.id),
+            onChanged: (val) async {
+              await _toggleAlbumSelection(album, val);
+            },
+          ),
+        ),
+        if (_isAlbumsLoading) _inlineLoadingRow(),
+      ],
+    );
+  }
+
+  Widget _buildInaccessibleAlbumsSection(BuildContext context) {
+    final shouldShow = _isAlbumsLoading || _blockedAlbums.isNotEmpty;
+    if (!shouldShow) return const SizedBox.shrink();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 10),
+        Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Inaccessible albums',
+                  style: Theme.of(context)
+                      .textTheme
+                      .titleMedium
+                      ?.copyWith(fontWeight: FontWeight.w600),
+                ),
+              ),
+              IconButton(
+                padding: const EdgeInsets.only(left: 8),
+                tooltip: 'More info',
+                icon: const Icon(Icons.info_outline),
+                onPressed: () {
+                  showDialog<void>(
+                    context: context,
+                    builder: (ctx) => AlertDialog(
+                      title: const Text('Inaccessible albums'),
+                      content: const Text(_inaccessibleAlbumsInfoText),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.of(ctx).pop(),
+                          child: const Text('OK'),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ],
+          ),
+        ),
+        if (_blockedAlbums.isNotEmpty)
+          Card(
+            elevation: 0,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(
+                color: Theme.of(context).colorScheme.outlineVariant,
+              ),
+            ),
+            child: Column(
+              children: _blockedAlbums
+                  .map(
+                    (a) => ListTile(
+                      leading: const Icon(Icons.lock_outline),
+                      title: Text(a.name),
+                    ),
+                  )
+                  .toList(),
+            ),
+          ),
+        if (_blockedAlbums.isEmpty && _isAlbumsLoading) _inlineLoadingRow(),
+      ],
+    );
+  }
+
   Widget _startStopFab({required bool running}) {
-    final disabled = _isInitialLoading ? true : _shouldDisableStart;
+    final disabled = _shouldDisableStart;
 
     final Color? bgColor =
         disabled ? null : (running ? Colors.red : Colors.green);
 
-    final tooltip = _isInitialLoading
-        ? 'Loading…'
+    final tooltip = _isAlbumsLoading
+        ? 'Loading albums…'
         : (running
             ? 'Stop compression'
             : (_hasOldFiles
@@ -505,7 +812,8 @@ class _SettingsTabState extends State<SettingsTab> {
         backgroundColor: bgColor,
         foregroundColor: Colors.white,
         icon: Icon(
-            running ? Icons.stop_circle_outlined : Icons.play_arrow_rounded),
+          running ? Icons.stop_circle_outlined : Icons.play_arrow_rounded,
+        ),
         label: Text(running ? 'Stop compression' : 'Start compression'),
       ),
     );
@@ -513,16 +821,7 @@ class _SettingsTabState extends State<SettingsTab> {
 
   @override
   Widget build(BuildContext context) {
-    if (_isInitialLoading) {
-      return Scaffold(
-        appBar: AppBar(title: const Text('Settings')),
-        body: const Center(child: CircularProgressIndicator()),
-      );
-    }
-
     final running = _manager.isRunning;
-    final bool allSelected =
-        _albums.isNotEmpty && _selectedAlbumIds.length == _albums.length;
 
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
@@ -570,57 +869,8 @@ class _SettingsTabState extends State<SettingsTab> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                if (_albums.isEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text('Use the button below to scan for albums.'),
-                        const SizedBox(height: 8),
-                        ElevatedButton.icon(
-                          onPressed: _isLocked
-                              ? null
-                              : () async {
-                                  if (mounted) {
-                                    setState(() => _isInitialLoading = true);
-                                  }
-                                  try {
-                                    await _runInitialLoad();
-                                  } finally {
-                                    if (mounted) {
-                                      setState(() => _isInitialLoading = false);
-                                    }
-                                  }
-                                },
-                          icon: const Icon(Icons.refresh),
-                          label: const Text('Reload albums & settings'),
-                        ),
-                      ],
-                    ),
-                  )
-                else ...[
-                  _selectAllAlbumsRow(
-                    allSelected: allSelected,
-                    onChanged: (val) async {
-                      await _setAllAlbumSelections(val);
-                    },
-                  ),
-                  const SizedBox(height: 4),
-                  Column(
-                    children: _albums
-                        .map(
-                          (album) => _albumRow(
-                            album: album,
-                            selected: _selectedAlbumIds.contains(album.id),
-                            onChanged: (val) async {
-                              await _toggleAlbumSelection(album, val);
-                            },
-                          ),
-                        )
-                        .toList(),
-                  ),
-                ],
+                _buildAlbumsSectionBody(),
+                _buildInaccessibleAlbumsSection(context),
               ],
             ),
           ),
