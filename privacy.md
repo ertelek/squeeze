@@ -64,6 +64,5 @@ We do not transfer your data internationally because we do not collect or transm
 We may update this policy for legal or feature changes. If we make material changes, we will update the “Effective date”.
 
 ## 12) Contact us
-For privacy questions or requests, contact:  
-**Evans Ehiorobo**  
+For privacy questions or requests, contact:
 **Email:** contact.ertelek@yahoo.com
