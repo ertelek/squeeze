@@ -1,7 +1,6 @@
 # Privacy Policy — Squeeze!
 
 **Effective date:** 21st October, 2025  
-**Developer:** Evans Ehiorobo (“we”, “us”, “our”)  
 **Contact:** contact.ertelek@yahoo.com
 
 Squeeze! (“the App”) helps you compress videos stored on your device. We designed it to work **locally on your device**. We do not run an account system and we do not send your personal data to our servers.
